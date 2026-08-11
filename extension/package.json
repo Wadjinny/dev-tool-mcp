@@ -1,0 +1,20 @@
+{
+  "name": "@dev-tool-mcp/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "watch": "tsx scripts/build.ts --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dev-tool-mcp/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.4",
+    "esbuild": "^0.25.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

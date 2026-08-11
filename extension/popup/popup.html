@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dev-tool-mcp</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="panel-header">
+      <div class="brand">dev-tool-mcp</div>
+      <div class="bridge-row">
+        <span class="label">MCP bridge</span>
+        <span id="bridge-dot" class="dot off" aria-hidden="true"></span>
+        <span id="bridge-status" class="data">…</span>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2 class="micro">This tab</h2>
+      <div id="active-title" class="title">—</div>
+      <div id="active-url" class="data url">—</div>
+      <div class="actions">
+        <button id="btn-connect" class="btn primary" type="button">Connect</button>
+        <button id="btn-disconnect" class="btn" type="button" hidden>Disconnect</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="micro">Agent target</h2>
+      <div id="target" class="data">No tab connected</div>
+    </section>
+
+    <section class="panel" id="error-panel" hidden>
+      <h2 class="micro">Last error</h2>
+      <div id="last-error" class="error"></div>
+    </section>
+
+    <section class="panel advanced">
+      <h2 class="micro">Advanced</h2>
+      <label class="port-row">
+        <span class="label">Port</span>
+        <input id="port" class="input" type="number" min="1" max="65535" />
+        <button id="btn-apply-port" class="btn" type="button">Apply</button>
+        <button id="btn-reconnect" class="btn" type="button">Reconnect</button>
+      </label>
+      <p class="hint">
+        Access is limited to the Connected tab and a local MCP server on 127.0.0.1.
+        The debugger permission is required for DevTools-depth tools.
+      </p>
+    </section>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

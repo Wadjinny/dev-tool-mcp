@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "dev-tool-mcp",
+  "version": "0.1.0",
+  "description": "Let a local MCP agent automate and inspect a Connected Chrome tab.",
+  "permissions": [
+    "tabs",
+    "windows",
+    "scripting",
+    "storage",
+    "debugger",
+    "webNavigation",
+    "activeTab",
+    "cookies",
+    "alarms"
+  ],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background/sw.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "dev-tool-mcp",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": []
+}
