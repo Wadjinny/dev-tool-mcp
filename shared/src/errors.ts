@@ -9,6 +9,10 @@ export const ErrorCodes = {
   CONTENT_SCRIPT_FAILED: "CONTENT_SCRIPT_FAILED",
   TIMEOUT: "TIMEOUT",
   INVALID_REF: "INVALID_REF",
+  INVALID_PIN: "INVALID_PIN",
+  PICK_CANCELLED: "PICK_CANCELLED",
+  PICK_TIMEOUT: "PICK_TIMEOUT",
+  PICK_IN_PROGRESS: "PICK_IN_PROGRESS",
   UNAUTHORIZED: "UNAUTHORIZED",
   UNKNOWN: "UNKNOWN",
 } as const;
@@ -39,6 +43,11 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   CONTENT_SCRIPT_FAILED: "Content script injection or automation helper failed.",
   TIMEOUT: "Request timed out.",
   INVALID_REF: "Snapshot ref is missing or stale. Take a new browser_snapshot.",
+  INVALID_PIN:
+    "Pin is missing or stale. Pick the element again or use a fresh snapshot ref.",
+  PICK_CANCELLED: "Element pick was cancelled.",
+  PICK_TIMEOUT: "Element pick timed out before a selection was made.",
+  PICK_IN_PROGRESS: "An element pick is already in progress.",
   UNAUTHORIZED: "Handshake token mismatch.",
   UNKNOWN: "Unknown error.",
 };

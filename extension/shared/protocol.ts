@@ -1,6 +1,7 @@
 export {
   DEFAULT_WS_PORT,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  MAX_NETWORK_WAIT_FOR_MS,
   PROTOCOL_VERSION,
   emptyBridgeState,
   type BridgeState,

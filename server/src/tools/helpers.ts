@@ -49,8 +49,9 @@ export function fromThrown(err: unknown): ToolResult {
 export async function callExt(
   method: string,
   params: Record<string, unknown> = {},
+  timeoutMs?: number,
 ): Promise<unknown> {
-  return getBridge().request(method, params);
+  return getBridge().request(method, params, timeoutMs);
 }
 
 export async function ensureDevtoolsAttached(): Promise<void> {

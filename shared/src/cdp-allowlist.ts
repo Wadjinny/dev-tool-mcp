@@ -10,15 +10,21 @@ export const CDP_ALLOWED_DOMAINS = [
   "Input",
   "Overlay",
   "Accessibility",
+  "Target",
 ] as const;
 
+/** Mutating / high-risk Target + Browser methods stay denied even if the domain is listed. */
 const DENIED_EXACT = new Set([
   "Target.createBrowserContext",
+  "Target.disposeBrowserContext",
+  "Target.createTarget",
   "Target.closeTarget",
   "Target.attachToBrowserTarget",
+  "Target.activateTarget",
   "Browser.close",
   "Browser.crash",
   "Browser.grantPermissions",
+  "Browser.setPermission",
   "SystemInfo.getInfo",
 ]);
 

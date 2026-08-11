@@ -114,8 +114,10 @@ extension/
     sw.ts              # WS client, keepalive, command router
     debugger.ts        # attach/detach, CDP send, event buffers
     tabs.ts            # Connect state, restricted-URL checks
+    pins.ts            # pin store + blocking pick waiter
   content/
     automation.ts      # snapshot, click, type, hover, drag (isolated world)
+    picker.ts          # in-page pick overlay + selector helper
   popup/
     popup.html
     popup.css
@@ -221,11 +223,12 @@ Other events (buffered for tools): `console.message`, `network.request`, `networ
 | `page.snapshot` | → ext | A11y tree via content script |
 | `page.click` / `hover` / `drag` / `type` / `pressKey` | → ext | Interaction by ref or selector policy |
 | `page.screenshot` | → ext | Capture visible tab (PNG base64) |
-| `page.evaluate` | → ext | Run JS (world: `isolated` \| `main`) |
+| `page.evaluate` | → ext | Run JS (world: `isolated` \| `main`; optional `pin` binds `el`; CSP auto-fallback) |
 | `debugger.attach` / `debugger.detach` | → ext | `chrome.debugger` |
 | `debugger.sendCommand` | → ext | CDP method + params (allowlist enforced server-side too) |
 | `console.list` / `console.clear` | → ext | From CDP buffer |
-| `network.list` / `network.getResponseBody` | → ext | From CDP buffer |
+| `network.list` / `network.get` / `network.getResponseBody` / `network.forPin` | → ext | From CDP buffer (filters, WS, wait, pin correlation) |
+| `pins.inspect` | → ext | Rich pin element inspection |
 | `storage.getCookies` / `setCookie` / `clearCookies` | → ext | Cookies for Connected origin |
 | `storage.getLocal` / `setLocal` / `getSession` / `setSession` | → ext | Web storage via script injection or CDP |
 
@@ -359,23 +362,55 @@ Accessibility snapshot of the Connected page (YAML or structured tree with `ref`
 
 #### `browser_click`
 
-**Params**: `{ ref: string, button?: "left" | "right" | "middle", doubleClick?: boolean }`  
+**Params**: `{ ref?: string, pin?: string, button?: "left" | "right" | "middle", doubleClick?: boolean }`  
+Exactly one of `ref` or `pin` is required.  
 **Returns**: `{ ok: true }`
 
 #### `browser_hover`
 
-**Params**: `{ ref: string }`  
+**Params**: `{ ref?: string, pin?: string }` (exactly one)  
 **Returns**: `{ ok: true }`
 
 #### `browser_drag`
 
-**Params**: `{ startRef: string, endRef: string }`  
+**Params**: `{ startRef?: string, endRef?: string, startPin?: string, endPin?: string }`  
+Each endpoint requires exactly one of ref or pin.  
 **Returns**: `{ ok: true }`
 
 #### `browser_type`
 
-**Params**: `{ ref: string, text: string, submit?: boolean, slowly?: boolean }`  
+**Params**: `{ ref?: string, pin?: string, text: string, submit?: boolean, slowly?: boolean }` (exactly one of ref/pin)  
 **Returns**: `{ ok: true }`
+
+#### `browser_pick_element`
+
+Enter in-page pick mode on the Connected tab (overlay highlight). Blocks until the user clicks an element, presses Esc, or the timeout elapses (default 90s). Also available from the popup **Pick element** button (non-blocking; pin appears in `browser_pins`).
+
+**Params**: `{ prompt?: string }`  
+**Returns**: `PinDescriptor` (`id`, `tabId`, `url`, `tag`, `role`, `name`, `selector`, `box`, `createdAt`)
+
+RPC: `page.pickElement`. Pins accumulate (`pin_1`, `pin_2`, …). Cleared on main-frame navigation, Disconnect, or `browser_pin_clear`. Top frame only in v1.
+
+#### `browser_pick_cancel`
+
+**Params**: `{}`  
+**Returns**: `{ ok: true }`  
+Cancels an in-progress pick (`PICK_CANCELLED` for the waiting `browser_pick_element` call).
+
+#### `browser_pins`
+
+**Params**: `{}`  
+**Returns**: `{ pins: PinDescriptor[] }`
+
+#### `browser_pin_inspect`
+
+**Params**: `{ pin: string }`  
+**Returns**: live inspection (`attrs`, `src`/`currentSrc`/`href`, `nearbyText`, `outerHTML`, `relatedUrls`, `matchCount`, …) plus stored `PinDescriptor`
+
+#### `browser_pin_clear`
+
+**Params**: `{ id?: string }` — omit to clear all  
+**Returns**: `{ cleared: number }`
 
 #### `browser_screenshot`
 
@@ -395,17 +430,79 @@ Prefer CDP buffer when debugger attached; otherwise empty + note, or content-scr
 Explicit attach control. Auto-attach is also allowed on first DevTools tool (see §7).
 
 **Params**: `{}`  
-**Returns**: `{ attached: boolean }`
+**Returns** (`attach`): `{ attached: boolean, workersAttached: [{ targetId, type, url }], workerAttachErrors?: [...] }`  
+**Returns** (`detach`): `{ attached: false }`
+
+On attach, related **existing** workers (`worker` / `shared_worker` / `service_worker` for the Connected tab or same origin) are attached via `chrome.debugger.getTargets` + `attach({ targetId })` with `Network.enable`. New workers continue to use CDP `Target.setAutoAttach` (flatten). Detach tears down the tab session and any worker sessions this extension explicitly attached.
+
+#### `devtools_targets`
+
+**Params**: `{}`  
+**Returns**: `{ targets: [{ targetId, type, url, title?, tabId?, attached }], debuggerAttached }`
+
+Lists the page target plus related workers from `chrome.debugger.getTargets` (same relatedness rules as attach).
 
 #### `devtools_network_requests`
 
-**Params**: `{ filter?: string, limit?: number }`  
-**Returns**: `{ requests: NetworkEntry[] }` (url, method, status, type, id, …)
+Auto-attaches CDP. Buffer fills only after attach (`bufferStartedAt` in the response). Existing related workers are attached on debugger attach; new workers via `Target.setAutoAttach`.
+
+**Params**:
+```
+{
+  filter?: string,          // legacy URL substring
+  url?: string,             // URL substring
+  urlRegex?: string,
+  method?: string,
+  host?: string,
+  type?: string,            // CDP resource type
+  status?: number,
+  statusMin?: number,
+  statusMax?: number,
+  since?: number,           // ms epoch
+  resourceKind?: "http" | "websocket",
+  targetType?: string,      // page | worker | service_worker | …
+  limit?: number,
+  includeWebSocketMessages?: boolean,
+  waitForMs?: number        // block until a new matching request; max 300000; bridge timeout = wait + 10s
+}
+```
+
+**Returns**: `{ requests: NetworkEntry[], bufferStartedAt, debuggerAttached, timedOut?, note? }`
+
+`NetworkEntry` includes headers, postData, initiator, fromCache, serviceWorkerResponseSource, targetType/targetId, and optional WebSocket frames.
+
+#### `devtools_network_summary`
+
+Compact aggregation over the network ring buffer (no extra CDP). Prefer this for host/path discovery before full `devtools_network_requests`.
+
+**Params**: `{ since?: number, limitHosts?: number, limitPaths?: number }`  
+**Returns**:
+```
+{
+  bufferStartedAt, debuggerAttached, total,
+  byHost: [{ host, count, lastTimestamp }],
+  byTargetType: Record<string, number>,
+  topPaths: [{ method, origin, pathPrefix, count, lastTimestamp }],
+  webSockets: [{ url, id, messageCount?, finished? }]
+}
+```
+
+#### `devtools_network_request`
+
+**Params**: `{ requestId: string }`  
+**Returns**: `{ request: NetworkEntry | null, bufferStartedAt }` (full detail + WS frames)
 
 #### `devtools_network_body`
 
 **Params**: `{ requestId: string }`  
 **Returns**: `{ body: string, base64Encoded: boolean }`
+
+#### `devtools_network_for_pin`
+
+Inspects a pin’s related URLs (`src` / `href` / CSS backgrounds) and returns matching buffered requests.
+
+**Params**: `{ pin: string, limit?: number, includeWebSocketMessages?: boolean }`  
+**Returns**: `{ pin, relatedUrls, requests, bufferStartedAt, note? }`
 
 #### `devtools_console_messages`
 
@@ -416,8 +513,10 @@ Alias/stricter form of console via CDP only.
 
 #### `devtools_evaluate`
 
-**Params**: `{ expression: string, world?: "isolated" | "main", awaitPromise?: boolean }`  
-**Returns**: `{ result: unknown }` (JSON-serializable; truncate large values)
+**Params**: `{ expression: string, world?: "isolated" | "main", awaitPromise?: boolean, pin?: string }`  
+**Returns**: `{ result: unknown, world?: string, fallbackFrom?: string, note?: string }`
+
+When `pin` is set, the expression is evaluated with `el` bound to the pinned element. Isolated-world failures caused by CSP `unsafe-eval` automatically retry via CDP `Runtime.evaluate` in the main world.
 
 #### `devtools_get_box_model`
 
@@ -448,8 +547,8 @@ Raw CDP escape hatch.
 
 **v1 allowlist** (extend carefully):
 
-- Allowed domains: `Runtime`, `Console`, `Network`, `DOM`, `CSS`, `Page`, `DOMStorage`, `Input` (only if needed), `Overlay` (highlight)
-- Denied: `Browser.*`, `Target.createBrowserContext`, `Target.closeTarget` (except Connected tab if ever needed), arbitrary process/OS controls, extension debugging of other extensions
+- Allowed domains: `Runtime`, `Console`, `Network`, `DOM`, `CSS`, `Page`, `DOMStorage`, `Input`, `Overlay`, `Accessibility`, `Target` (read / attach helpers)
+- Denied exact: `Browser.*`, `Target.createBrowserContext`, `Target.disposeBrowserContext`, `Target.createTarget`, `Target.closeTarget`, `Target.attachToBrowserTarget`, `Target.activateTarget`, `Browser.grantPermissions`, `SystemInfo.getInfo`
 
 Server and extension both enforce the allowlist.
 
@@ -463,8 +562,10 @@ Server and extension both enforce the allowlist.
 2. First call to any `devtools_*` tool (except detach) **auto-attaches** if not attached.
 3. Popup **Disconnect** always detaches.
 4. If attach fails (e.g. DevTools UI already open on that tab), return `DEBUGGER_ATTACH_FAILED` with guidance: close DevTools on that tab and retry.
-5. While attached, buffer `Console` and `Network` events in the extension (ring buffer, e.g. last 1000 entries per channel).
-6. Do not leave debugger attached after extension unload if possible; best-effort detach on SW shutdown.
+5. While attached, buffer `Console` and `Network` events in the extension (ring buffer, e.g. last 1000 entries per channel), including WebSocket handshake/frames when emitted.
+6. On attach: enable `Target.setAutoAttach` (flatten) for **new** workers; also enumerate related **existing** workers via `chrome.debugger.getTargets` and `attach({ targetId })` with `Network.enable` (CDP `Target.getTargets` is often denied on tab debugger sessions).
+7. `waitForMs` max is `MAX_NETWORK_WAIT_FOR_MS` (300000); the MCP bridge timeout is `waitForMs + 10000` so expiry returns `{ timedOut: true }` instead of a bridge TIMEOUT.
+8. Do not leave debugger attached after extension unload if possible; best-effort detach on SW shutdown (tab + explicitly attached workers).
 
 ### Known limitations
 
@@ -473,9 +574,13 @@ Server and extension both enforce the allowlist.
 | `chrome.debugger` exclusivity | Open DevTools panel on the Connected tab often blocks attach |
 | MV3 service worker sleep | Keepalive via WS ping; reconnect with backoff; in-flight requests may fail with `EXTENSION_DISCONNECTED` |
 | Restricted pages | Cannot Connect / inject / debug |
-| CSP / sandboxed frames | Some evaluate / injection paths fail; prefer a11y refs |
+| CSP / sandboxed frames | Isolated `new Function` evaluate can fail; auto-fallback to CDP main world on `unsafe-eval` CSP errors |
+| Pre-attach network | Requests before attach are not in the buffer; use `waitForMs` / reload after attach |
+| Worker network | Existing + new workers attached best-effort; still invisible if Chrome omits the target from `getTargets` |
 | `fullPage` screenshot | May need CDP Page.captureScreenshot stitching; mark best-effort in v1 |
 | Install warning | `debugger` permission is scary; document honestly |
+| Element pick scope | Top frame only; no iframe / open shadow-root piercing in v1 |
+| Pin durability | Best-effort CSS selectors; live nodes cleared on navigation |
 
 ---
 
@@ -495,6 +600,10 @@ Stable `error.code` values returned through MCP tool errors:
 | `CONTENT_SCRIPT_FAILED` | Injection or automation helper failed |
 | `TIMEOUT` | Request exceeded timeout |
 | `INVALID_REF` | Snapshot ref missing / stale |
+| `INVALID_PIN` | Pin missing / stale / unknown |
+| `PICK_CANCELLED` | User or agent cancelled element pick |
+| `PICK_TIMEOUT` | Element pick exceeded timeout (~90s) |
+| `PICK_IN_PROGRESS` | A pick session is already active |
 | `UNAUTHORIZED` | Handshake token mismatch |
 
 Messages should be short and actionable (e.g. “Open the dev-tool-mcp popup and click Connect on the target tab.”).
@@ -524,7 +633,8 @@ User flow:
 1. Start / enable the MCP server in Cursor (spawns Node process + WS listener).
 2. Load the unpacked extension from `extension/`.
 3. Open the target site in Chrome; click the extension → **Connect**.
-4. Ask the agent to automate or inspect that tab.
+4. Optionally **Pick element** (or let the agent call `browser_pick_element`) to pin targets.
+5. Ask the agent to automate or inspect that tab.
 
 ---
 

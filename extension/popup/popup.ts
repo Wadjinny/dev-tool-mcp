@@ -2,6 +2,7 @@ type PopupState = {
   bridgeStatus: "connected" | "disconnected" | "reconnecting";
   lastError: string | null;
   port: number;
+  pinCount?: number;
   state: {
     connectedTabId: number | null;
     connectedTabUrl: string | null;
@@ -23,7 +24,9 @@ const els = {
   activeUrl: document.getElementById("active-url")!,
   btnConnect: document.getElementById("btn-connect") as HTMLButtonElement,
   btnDisconnect: document.getElementById("btn-disconnect") as HTMLButtonElement,
+  btnPick: document.getElementById("btn-pick") as HTMLButtonElement,
   target: document.getElementById("target")!,
+  pinCount: document.getElementById("pin-count")!,
   errorPanel: document.getElementById("error-panel")!,
   lastError: document.getElementById("last-error")!,
   port: document.getElementById("port") as HTMLInputElement,
@@ -66,7 +69,9 @@ function render(data: PopupState): void {
 
   els.btnConnect.hidden = isThisConnected;
   els.btnDisconnect.hidden = !isThisConnected;
+  els.btnPick.hidden = !isThisConnected;
   els.btnConnect.disabled = !!active?.restricted || !active?.id;
+  els.btnPick.disabled = !isThisConnected;
   if (active?.restricted) {
     els.btnConnect.title = "This URL cannot be Connected";
   } else {
@@ -82,6 +87,8 @@ function render(data: PopupState): void {
   } else {
     els.target.textContent = "No tab connected";
   }
+
+  els.pinCount.textContent = `Pins: ${data.pinCount ?? 0}`;
 
   if (data.lastError) {
     els.errorPanel.hidden = false;
@@ -118,6 +125,21 @@ els.btnDisconnect.addEventListener("click", () => {
   void (async () => {
     await send({ type: "disconnect" });
     await refresh();
+  })();
+});
+
+els.btnPick.addEventListener("click", () => {
+  void (async () => {
+    const res = await send<{ ok: boolean; error?: string }>({
+      type: "startPicker",
+    });
+    if (!res.ok && res.error) {
+      els.errorPanel.hidden = false;
+      els.lastError.textContent = res.error;
+      return;
+    }
+    // Popup may close; picker continues in the Connected tab.
+    window.close();
   })();
 });
 

@@ -118,6 +118,11 @@ body {
   overflow: hidden;
 }
 
+.pins {
+  margin-top: 6px;
+  color: var(--text-muted);
+}
+
 .actions {
   display: flex;
   gap: 6px;
