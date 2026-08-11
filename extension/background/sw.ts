@@ -185,12 +185,12 @@ async function resolveFrameSelector(
     return frame;
   }
   const q = String(frame).toLowerCase();
-  const match = frames.find(
+  const matches = frames.filter(
     (f) =>
       f.url.toLowerCase().includes(q) ||
       (f.name && f.name.toLowerCase().includes(q)),
   );
-  if (!match) {
+  if (!matches.length) {
     throw bridgeError(
       ErrorCodes.INVALID_REF,
       `No frame matching ${JSON.stringify(frame)}. Known: ${frames
@@ -198,7 +198,14 @@ async function resolveFrameSelector(
         .join(", ")}`,
     );
   }
-  return match.frameId;
+  // Prefer exact URL/name, then child frames (avoid matching the shell tab URL first).
+  const exact = matches.find(
+    (f) => f.url.toLowerCase() === q || (f.name && f.name.toLowerCase() === q),
+  );
+  if (exact) return exact.frameId;
+  const child = matches.find((f) => f.frameId !== 0);
+  if (child) return child.frameId;
+  return matches[0]!.frameId;
 }
 
 async function ensureContentScript(tabId: number): Promise<void> {
