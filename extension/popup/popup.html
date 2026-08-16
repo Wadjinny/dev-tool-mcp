@@ -33,6 +33,22 @@
       <div id="pin-count" class="data pins">Pins: 0</div>
     </section>
 
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="micro">Bridges</h2>
+        <button id="btn-refresh-bridges" class="btn tiny" type="button">
+          Refresh
+        </button>
+      </div>
+      <div id="bridges" class="bridges">Scanning…</div>
+      <div id="pending-control" class="pending" hidden></div>
+      <p class="hint">
+        Every local MCP server stays connected. Only one instance may mutate the
+        Connected tab; others can inspect. An agent can ask for control — you
+        Allow or Deny in a Chrome notification. Control here grants instantly.
+      </p>
+    </section>
+
     <section class="panel" id="error-panel" hidden>
       <h2 class="micro">Last error</h2>
       <div id="last-error" class="error"></div>

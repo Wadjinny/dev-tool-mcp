@@ -693,10 +693,14 @@ if (!window.__devToolMcpListener) {
             result = syncPinPanel(
               (params.pins as Array<{
                 id: string;
+                tabId?: number;
+                url?: string;
                 tag: string;
                 role: string;
                 name: string;
                 selector: string | null;
+                box?: { x: number; y: number; width: number; height: number };
+                createdAt?: number;
               }>) ?? [],
             );
             break;

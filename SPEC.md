@@ -83,9 +83,10 @@ sequenceDiagram
 ### Trust model
 
 1. **Localhost only**: WebSocket listens on `127.0.0.1` (never `0.0.0.0`).
-2. **Connect gate**: Extension rejects all page-affecting commands unless a tab is Connected in the popup. MCP tools return a clear error if no Connected tab.
-3. **Handshake token** (recommended): On first MCP server start (or extension install), generate a random token. Extension stores it in `chrome.storage.local`; every WS message from the server must include it (or the initial WS upgrade authenticates with it). Reject mismatched clients.
-4. **No cloud**: Browser content stays on the machine; MCP host (Cursor) still receives tool results in its context by design of MCP.
+2. **Connect gate**: Page-affecting commands require a Connected tab. The user can Connect from the popup, or the agent can `browser_open` / `browser_navigate` a non-restricted URL (creates a tab and Connects it). Restricted URLs (`chrome://`, Web Store, …) are always rejected.
+3. **Per-port handshake token**: Each MCP instance has its own token (file, env, or generated). The extension fetches `GET /handshake` **per port** and stores `tokensByPort`. A mismatch closes only that socket.
+4. **Control lease**: The extension keeps a WebSocket to every discovered instance (ports 17373–17392, max 20). Read-only RPCs work from all. Mutating RPCs require the lease: auto-grant if free, otherwise a Chrome Allow/Deny notification. Popup **Control** grants instantly. Optional display name via `DEV_TOOL_MCP_NAME`.
+5. **No cloud**: Browser content stays on the machine; MCP host (Cursor) still receives tool results in its context by design of MCP.
 
 ### Connection state (server)
 
@@ -111,7 +112,8 @@ Extension is source of truth for `connectedTab*`; it pushes state updates to the
 extension/
   manifest.json
   background/          # service worker entry
-    sw.ts              # WS client, keepalive, command router
+    sw.ts              # command router, keepalive
+    hub.ts             # multi-WS fan-out, per-port tokens, control lease + notifications
     debugger.ts        # attach/detach, CDP send, event buffers
     tabs.ts            # Connect state, restricted-URL checks
     pins.ts            # pin store + blocking pick waiter
@@ -150,11 +152,12 @@ server/
 
 ### WebSocket protocol
 
-- **Transport**: `ws://127.0.0.1:<port>` (default port **17373**, overridable via env `DEV_TOOL_MCP_WS_PORT`).
+- **Transport**: `ws://127.0.0.1:<port>` (default port **17373**, overridable via env `DEV_TOOL_MCP_WS_PORT`). The extension connects to **every** instance in the discovery band (17373–17392).
 - **Framing**: one JSON object per WebSocket message (text frames).
 - **Direction**:
   - Server → extension: `request`
   - Extension → server: `response` | `event`
+- **Identity**: `BridgeIdentity.name` from `DEV_TOOL_MCP_NAME` (optional). Display label is `name :port` (name falls back to the cwd project folder).
 
 #### Request
 
@@ -207,7 +210,7 @@ server/
 }
 ```
 
-Other events (buffered for tools): `console.message`, `network.request`, `network.response`, `debugger.detached`.
+Other events (buffered for tools): `console.message`, `network.request`, `network.response`, `debugger.detached`, `control.changed`.
 
 #### Method catalog (extension RPC)
 
@@ -215,9 +218,11 @@ Other events (buffered for tools): `console.message`, `network.request`, `networ
 |--------|------|-------------|
 | `ping` | both | Liveness |
 | `state.get` | → ext | Current Connect / debugger state |
+| `control.request` / `release` / `status` | → ext | Control lease (notify on steal) |
 | `tabs.connect` | → ext | Connect given `tabId` (popup uses this; MCP may not expose) |
 | `tabs.disconnect` | → ext | Clear Connected tab; detach debugger |
-| `tabs.navigate` | → ext | `chrome.tabs.update` URL |
+| `tabs.open` | → ext | Create a tab at `url`, wait for load, Connect it |
+| `tabs.navigate` | → ext | `chrome.tabs.update` URL, or `tabs.open` if none Connected |
 | `tabs.goBack` / `tabs.goForward` | → ext | History |
 | `tabs.wait` | → ext | Wait ms and/or load complete |
 | `page.snapshot` | → ext | A11y tree via content script |
@@ -277,6 +282,7 @@ Job of the popup: **choose which tab the agent may control**, and show bridge he
 6. Closing the Connected tab auto-Disconnects and emits `state.changed`.
 7. Navigating the Connected tab to a restricted URL auto-Disconnects.
 8. Optional: badge on the extension icon (`ON` / empty) when a tab is Connected.
+9. **Bridges list**: every discovered MCP instance with `name :port`, connected vs controlling. **Control** grants the lease instantly (no notification). A pending steal shows as “pending from {name}”.
 
 ---
 
@@ -295,7 +301,10 @@ Job of the popup: **choose which tab the agent may control**, and show bridge he
     "storage",
     "debugger",
     "webNavigation",
-    "activeTab"
+    "activeTab",
+    "cookies",
+    "alarms",
+    "notifications"
   ],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background/sw.js", "type": "module" },
@@ -311,9 +320,10 @@ Prefer **programmatic injection** (`chrome.scripting.executeScript` / register c
 | `tabs` / `windows` | List active tab, navigate, read title/URL for popup |
 | `scripting` | Inject automation helpers into Connected tab |
 | `activeTab` | Extra affordance when user opens popup on a tab |
-| `storage` | Handshake token, last port, last error |
+| `storage` | Handshake tokens by port, controller port, last error |
 | `debugger` | CDP attach for DevTools-depth tools |
 | `webNavigation` | Load lifecycle, restricted-URL detection |
+| `notifications` | Allow/Deny prompt when an instance asks to steal the control lease |
 | `<all_urls>` | Inject / debugger on arbitrary https origins after user Connects |
 
 **Install UX note**: `debugger` triggers Chrome’s strong warning (“full access to DevTools…”). README/popup copy should state that access is limited to the user-Connected tab and a local MCP server.
@@ -324,19 +334,47 @@ Prefer **programmatic injection** (`chrome.scripting.executeScript` / register c
 
 Naming: `browser_*` for automation parity with Browser/Playwright MCP; `devtools_*` for debugger-backed tools. All tools operate on the **Connected** tab unless noted.
 
+### 6.0 Control lease
+
+#### `browser_request_control`
+
+Ask to become the instance that may mutate the Connected tab. Auto-grants if nobody holds the lease; otherwise shows a Chrome Allow/Deny notification (60s).
+
+**Params**: `{}`  
+**Returns**: `{ controllerPort, controlling, identity }`
+
+#### `browser_release_control`
+
+Yield the lease so the next instance can auto-grant without a notification.
+
+#### `browser_control_status`
+
+Who currently holds the lease.
+
+Mutating tools (`browser_click`, navigate, evaluate, …) auto-request control when needed. Read-only tools (`browser_snapshot`, network list, …) do not.
+
 ### 6.1 Automation
 
 #### `browser_tabs`
 
-List context for the agent: Connected tab + optionally other tabs (read-only metadata). Does not Connect tabs (user must use popup).
+List context for the agent: Connected tab + optionally other tabs (read-only metadata).
 
 **Params**: `{ includeOthers?: boolean }`  
 **Returns**: `{ connected: TabInfo | null, others?: TabInfo[] }`
 
+#### `browser_open`
+
+Open `url` in a **new** Chrome tab, wait for load, and Connect it. Does not require an existing Connected tab. Previous Connected tab is disconnected (pins/debugger cleared). Restricted URLs are rejected.
+
+**Params**: `{ url: string, active?: boolean }`  
+**Returns**: `{ url, title, tabId, opened: true, connectedTabId }`
+
 #### `browser_navigate`
 
+Navigate the Connected tab to a URL. If none is Connected, same as `browser_open`.
+
 **Params**: `{ url: string }`  
-**Returns**: `{ url, title }` after load (or timeout policy documented in errors).
+**Returns**: `{ url, title, tabId, opened: boolean }` after load.
 
 #### `browser_go_back` / `browser_go_forward`
 
@@ -591,7 +629,7 @@ Stable `error.code` values returned through MCP tool errors:
 | Code | When |
 |------|------|
 | `EXTENSION_DISCONNECTED` | No WebSocket from extension |
-| `NO_CONNECTED_TAB` | Bridge up but user has not Connected a tab |
+| `NO_CONNECTED_TAB` | No Connected tab — call `browser_open` or Connect in the popup |
 | `TAB_GONE` | Connected tab closed |
 | `RESTRICTED_URL` | Connect or navigate landed on a blocked URL |
 | `DEBUGGER_ATTACH_FAILED` | CDP attach failed / conflict |
@@ -605,6 +643,9 @@ Stable `error.code` values returned through MCP tool errors:
 | `PICK_TIMEOUT` | Element pick exceeded timeout (~90s) |
 | `PICK_IN_PROGRESS` | A pick session is already active |
 | `UNAUTHORIZED` | Handshake token mismatch |
+| `CONTROL_DENIED` | User denied a control-lease steal |
+| `CONTROL_REQUEST_TIMEOUT` | Allow/Deny notification expired (~60s) |
+| `CONTROL_REQUEST_PENDING` | Another instance already has a steal prompt open |
 
 Messages should be short and actionable (e.g. “Open the dev-tool-mcp popup and click Connect on the target tab.”).
 
@@ -621,7 +662,8 @@ After `server` is packaged (implementation phase):
       "command": "npx",
       "args": ["tsx", "/absolute/path/to/dev-tool-mcp/server/src/index.ts"],
       "env": {
-        "DEV_TOOL_MCP_WS_PORT": "17373"
+        "DEV_TOOL_MCP_WS_PORT": "17373",
+        "DEV_TOOL_MCP_NAME": "my-project"
       }
     }
   }
@@ -634,7 +676,7 @@ User flow:
 2. Load the unpacked extension from `extension/`.
 3. Open the target site in Chrome; click the extension → **Connect**.
 4. Optionally **Pick element** (or let the agent call `browser_pick_element`) to pin targets.
-5. Ask the agent to automate or inspect that tab.
+5. Ask the agent to automate or inspect that tab. A second Cursor session can inspect immediately; mutating that tab prompts a Chrome notification to Allow/Deny control.
 
 ---
 

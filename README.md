@@ -30,7 +30,8 @@ Add to your Cursor MCP config (absolute path required):
         "src/index.ts"
       ],
       "env": {
-        "DEV_TOOL_MCP_WS_PORT": "17373"
+        "DEV_TOOL_MCP_WS_PORT": "17373",
+        "DEV_TOOL_MCP_NAME": "vidfast-dl"
       }
     }
   }
@@ -46,14 +47,19 @@ Or after `pnpm build`:
       "command": "node",
       "args": ["/absolute/path/to/dev-tool-mcp/server/dist/index.js"],
       "env": {
-        "DEV_TOOL_MCP_WS_PORT": "17373"
+        "DEV_TOOL_MCP_WS_PORT": "17373",
+        "DEV_TOOL_MCP_NAME": "vidfast-dl"
       }
     }
   }
 }
 ```
 
-The server listens on `ws://127.0.0.1:17373` only (never `0.0.0.0`). Handshake token is stored at `~/.config/dev-tool-mcp/token` (override with `DEV_TOOL_MCP_TOKEN` / `DEV_TOOL_MCP_TOKEN_FILE`).
+The server listens on `ws://127.0.0.1:17373` only (never `0.0.0.0`). Each instance keeps its own handshake token (`~/.config/dev-tool-mcp/token`, or `DEV_TOOL_MCP_TOKEN` / `DEV_TOOL_MCP_TOKEN_FILE`). The extension fetches **that instance’s** token from `http://127.0.0.1:<port>/handshake` — instances do not need to share a file.
+
+Optional `DEV_TOOL_MCP_NAME` is the label shown in the popup and in control-request notifications (falls back to the project folder name). Always combined with `:port`.
+
+Up to **20** instances can bind in the discovery band `17373–17392`. The extension opens a WebSocket to each and keeps them all connected.
 
 ### 3. Load the extension
 
@@ -64,20 +70,26 @@ The server listens on `ws://127.0.0.1:17373` only (never `0.0.0.0`). Handshake t
 
 ### 4. Connect a tab
 
-1. Open the target site in Chrome (logged-in session stays yours)
-2. Click the **dev-tool-mcp** extension icon
-3. Click **Connect** on that tab
-4. Ask the agent to automate or inspect it
+Either:
+
+- Open the site in Chrome, click the **dev-tool-mcp** icon, then **Connect**, or
+- Ask the agent to `browser_open` / `browser_navigate` a URL (creates a tab and Connects it)
+
+Restricted URLs (`chrome://`, extension pages, Web Store) cannot be opened or Connected.
 
 Only one Connected tab at a time. Disconnect clears the gate and detaches the debugger.
 
+Several Cursor sessions can stay attached at once. **Read-only** tools work from every instance. **Mutating** tools need the control lease: auto-granted if free, otherwise a Chrome notification (Allow / Deny). The popup **Control** button grants instantly. Agents can also call `browser_request_control` / `browser_release_control`.
+
 ### 5. Pin elements (optional)
 
-After Connect, use **Pick element** in the popup (or have the agent call `browser_pick_element`) to enter in-page pick mode. Hover highlights a target; click pins it as `pin_N`. Esc cancels. Pins accumulate until clear, navigation, or Disconnect. Interaction tools accept `pin` instead of a snapshot `ref`.
+After Connect, use **Pick element** in the popup (or have the agent call `browser_pick_element`) to enter in-page pick mode. Hover highlights a target; click pins it as `pin_N`. Esc cancels. Pins accumulate until clear, navigation, or Disconnect. Interaction tools accept `pin` instead of a snapshot `ref`. The in-page pin panel has a copy button for `dev-tool-mcp://tab/{tabId}/pin/{id}`.
 
 ## Tools (summary)
 
-**Automation** (no debugger required): `browser_tabs`, `browser_navigate`, `browser_go_back` / `browser_go_forward`, `browser_wait`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_drag`, `browser_type`, `browser_press_key`, `browser_screenshot`, `browser_console_messages`, `browser_pick_element`, `browser_pick_cancel`, `browser_pins`, `browser_pin_inspect`, `browser_pin_clear`
+**Control**: `browser_request_control`, `browser_release_control`, `browser_control_status`
+
+**Automation** (no debugger required): `browser_tabs`, `browser_open`, `browser_navigate`, `browser_go_back` / `browser_go_forward`, `browser_wait`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_drag`, `browser_type`, `browser_press_key`, `browser_screenshot`, `browser_console_messages`, `browser_pick_element`, `browser_pick_cancel`, `browser_pins`, `browser_pin_inspect`, `browser_pin_clear`
 
 **DevTools** (auto-attaches CDP on first use): `devtools_attach` / `devtools_detach`, `devtools_targets`, `devtools_network_requests` (rich filters, WebSocket, `waitForMs` up to 300s), `devtools_network_summary`, `devtools_network_request`, `devtools_network_body`, `devtools_network_for_pin`, `devtools_console_messages`, `devtools_evaluate` (pin-bound `el`, CSP fallback to main/CDP), `devtools_get_box_model`, `devtools_get_computed_style`, `devtools_cookies`, `devtools_storage`, `devtools_cdp` (allowlisted domains including read-mostly `Target.*`)
 
@@ -94,9 +106,9 @@ Reload the unpacked extension in Chrome after rebuilds.
 
 ## Trust model
 
-- Localhost WebSocket + HTTP handshake only
+- Localhost WebSocket + HTTP handshake only (token fetched **per port**)
 - Page-affecting commands rejected until you Connect a tab in the popup
-- Shared handshake token; extension fetches it from `http://127.0.0.1:<port>/handshake`
+- Mutating commands also require the control lease (notification or popup Control)
 - No cloud relay of browser traffic
 
 ## Manual test checklist
@@ -104,6 +116,9 @@ Reload the unpacked extension in Chrome after rebuilds.
 - [ ] MCP server starts; `/health` and `/handshake` respond on 127.0.0.1
 - [ ] Extension popup shows bridge Connected
 - [ ] Connect on a normal https tab; badge shows ON
+- [ ] `browser_open` with an https URL creates a tab, Connects it, and badge shows ON (no popup Connect needed)
+- [ ] `browser_navigate` with no Connected tab also opens and Connects
+- [ ] `browser_open` / `browser_navigate` to `chrome://` fails with RESTRICTED_URL
 - [ ] Connect fails on `chrome://` with a clear error
 - [ ] `browser_snapshot` then `browser_click` / `browser_type` work
 - [ ] Popup **Pick element** or `browser_pick_element` pins a node; `browser_pins` lists it; `browser_pin_inspect` returns attrs/relatedUrls
@@ -119,6 +134,10 @@ Reload the unpacked extension in Chrome after rebuilds.
 - [ ] `waitForMs` above 120s (e.g. 130000) with no match returns `{ timedOut: true }` (not bridge TIMEOUT)
 - [ ] Isolated `devtools_evaluate` on a CSP-locked page falls back to main/CDP with a note
 - [ ] Disconnect / `devtools_detach` detaches debugger (tab + workers) and clears agent target
+- [ ] Two MCP instances both show as connected in the popup Bridges list
+- [ ] A mutating tool from a second instance shows an Allow/Deny notification; Deny leaves the first in control
+- [ ] Popup **Control** on another bridge grants instantly without a notification
+- [ ] `DEV_TOOL_MCP_NAME` appears as `name :port` in the popup and notification
 
 ## Limitations
 

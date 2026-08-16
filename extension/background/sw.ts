@@ -2,13 +2,11 @@ import {
   DEFAULT_WS_PORT,
   ErrorCodes,
   PICK_ELEMENT_TIMEOUT_MS,
-  PROTOCOL_VERSION,
   bridgeError,
   type BridgeError,
   type BridgeState,
   type NetworkListFilter,
   type RequestMessage,
-  type ResponseMessage,
 } from "@dev-tool-mcp/shared";
 import {
   attachDebugger,
@@ -28,6 +26,26 @@ import {
   setDebuggerEventEmitter,
   waitForNetwork,
 } from "./debugger.js";
+import {
+  anyExtensionConnected,
+  controlStatus,
+  emitEvent,
+  ensureControl,
+  getControllerPort,
+  getTokenForPort,
+  initHubListeners,
+  pendingControlLabel,
+  reconnectAll,
+  refreshBridges,
+  releaseControl,
+  requestControl,
+  respond,
+  setHubHooks,
+  setLastError,
+  setManualControl,
+  startHub,
+  summaryBridgeStatus,
+} from "./hub.js";
 import {
   allocatePinId,
   armNextKeepPick,
@@ -55,66 +73,15 @@ import {
   waitForLoad,
 } from "./tabs.js";
 
-const STORAGE = {
-  token: "handshakeToken",
-  port: "wsPort",
-  lastError: "lastError",
-  bridgeStatus: "bridgeStatus",
-} as const;
-
-let socket: WebSocket | null = null;
-let reconnectAttempt = 0;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let pingTimer: ReturnType<typeof setInterval> | null = null;
-let intentionalClose = false;
-
-async function getPort(): Promise<number> {
-  const data = await chrome.storage.local.get(STORAGE.port);
-  const port = data[STORAGE.port];
-  return typeof port === "number" ? port : Number(DEFAULT_WS_PORT);
-}
-
-async function getToken(): Promise<string | null> {
-  const data = await chrome.storage.local.get(STORAGE.token);
-  const token = data[STORAGE.token];
-  return typeof token === "string" ? token : null;
-}
-
-async function setLastError(message: string | null): Promise<void> {
-  if (message) {
-    await chrome.storage.local.set({ [STORAGE.lastError]: message });
-  } else {
-    await chrome.storage.local.remove(STORAGE.lastError);
-  }
-}
-
-async function setBridgeStatus(
-  status: "connected" | "disconnected" | "reconnecting",
-): Promise<void> {
-  await chrome.storage.local.set({ [STORAGE.bridgeStatus]: status });
-}
-
-async function fetchHandshake(port: number): Promise<string> {
-  const res = await fetch(`http://127.0.0.1:${port}/handshake`);
-  if (!res.ok) throw new Error(`Handshake HTTP ${res.status}`);
-  const data = (await res.json()) as { token: string };
-  await chrome.storage.local.set({
-    [STORAGE.token]: data.token,
-    [STORAGE.port]: port,
-  });
-  return data.token;
-}
-
-function emitEvent(event: string, payload: unknown): void {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "event", event, payload }));
-  }
-}
-
+setHubHooks({
+  onRequest: (msg, ws, port) => handleRequest(msg, ws, port),
+  onConnected: () => pushState(),
+});
 setDebuggerEventEmitter(emitEvent);
+initHubListeners();
 
 async function currentState(): Promise<BridgeState> {
-  const base = await buildState(socket?.readyState === WebSocket.OPEN);
+  const base = await buildState(anyExtensionConnected());
   const tabId = await getConnectedTabId();
   return {
     ...base,
@@ -336,13 +303,7 @@ function withDragTargets(
 async function syncPinsToTab(tabId: number): Promise<void> {
   try {
     await pageAction(tabId, "pins.sync", {
-      pins: listPins().map((p) => ({
-        id: p.id,
-        tag: p.tag,
-        role: p.role,
-        name: p.name,
-        selector: p.selector,
-      })),
+      pins: listPins(),
     });
   } catch {
     // content may be gone
@@ -702,18 +663,15 @@ async function cdpFrameIdForChromeFrame(
   );
 }
 
-function respond(id: string, ok: boolean, result?: unknown, error?: BridgeError): void {
-  if (socket?.readyState !== WebSocket.OPEN) return;
-  const msg: ResponseMessage = ok
-    ? { type: "response", id, ok: true, result }
-    : { type: "response", id, ok: false, error };
-  socket.send(JSON.stringify(msg));
-}
-
-async function handleRequest(msg: RequestMessage): Promise<void> {
-  const token = await getToken();
+async function handleRequest(
+  msg: RequestMessage,
+  ws: WebSocket,
+  port: number,
+): Promise<void> {
+  const token = await getTokenForPort(port);
   if (!token || msg.token !== token) {
     respond(
+      ws,
       msg.id,
       false,
       undefined,
@@ -723,8 +681,22 @@ async function handleRequest(msg: RequestMessage): Promise<void> {
   }
 
   try {
+    if (msg.method === "control.request") {
+      respond(ws, msg.id, true, await requestControl(port));
+      return;
+    }
+    if (msg.method === "control.release") {
+      respond(ws, msg.id, true, await releaseControl(port));
+      return;
+    }
+    if (msg.method === "control.status") {
+      respond(ws, msg.id, true, await controlStatus(port));
+      return;
+    }
+
+    await ensureControl(port, msg.method);
     const result = await route(msg.method, msg.params ?? {});
-    respond(msg.id, true, result);
+    respond(ws, msg.id, true, result);
   } catch (err) {
     const e = err as BridgeError;
     const error: BridgeError =
@@ -735,8 +707,69 @@ async function handleRequest(msg: RequestMessage): Promise<void> {
             err instanceof Error ? err.message : String(err),
           );
     await setLastError(`${error.code}: ${error.message}`);
-    respond(msg.id, false, undefined, error);
+    respond(ws, msg.id, false, undefined, error);
   }
+}
+
+async function switchConnectedTab(tabId: number): Promise<BridgeState> {
+  const prev = await getConnectedTabId();
+  if (prev != null && prev !== tabId) {
+    await clearPinsAndLocal(prev);
+    if (isDebuggerAttached(prev)) {
+      await detachDebugger();
+    }
+  }
+  const state = await connectTab(tabId);
+  try {
+    await ensureContentScript(tabId);
+  } catch {
+    // injection may fail until page settles; Connect still succeeds
+  }
+  const full = {
+    ...state,
+    debuggerAttached: isDebuggerAttached(tabId),
+  };
+  emitEvent("state.changed", full);
+  return full;
+}
+
+async function openAndConnectTab(
+  url: string,
+  active: boolean,
+): Promise<{
+  url: string | undefined;
+  title: string | undefined;
+  tabId: number;
+  opened: boolean;
+  connectedTabId: number | null;
+}> {
+  if (isRestrictedUrl(url)) {
+    throw bridgeError(
+      ErrorCodes.RESTRICTED_URL,
+      "Cannot open a restricted URL.",
+    );
+  }
+  const created = await chrome.tabs.create({ url, active });
+  if (created.id == null) {
+    throw bridgeError(ErrorCodes.TAB_GONE, "Failed to create tab.");
+  }
+  await waitForLoad(created.id, "complete");
+  const updated = await chrome.tabs.get(created.id);
+  if (isRestrictedUrl(updated.url)) {
+    await chrome.tabs.remove(created.id).catch(() => undefined);
+    throw bridgeError(
+      ErrorCodes.RESTRICTED_URL,
+      "Opened tab landed on a restricted URL.",
+    );
+  }
+  const state = await switchConnectedTab(created.id);
+  return {
+    url: updated.url,
+    title: updated.title,
+    tabId: created.id,
+    opened: true,
+    connectedTabId: state.connectedTabId,
+  };
 }
 
 async function route(
@@ -752,25 +785,7 @@ async function route(
 
     case "tabs.connect": {
       const tabId = Number(params.tabId);
-      const prev = await getConnectedTabId();
-      if (prev != null && prev !== tabId) {
-        await clearPinsAndLocal(prev);
-        if (isDebuggerAttached(prev)) {
-          await detachDebugger();
-        }
-      }
-      const state = await connectTab(tabId);
-      try {
-        await ensureContentScript(tabId);
-      } catch {
-        // injection may fail until page settles; Connect still succeeds
-      }
-      const full = {
-        ...state,
-        debuggerAttached: isDebuggerAttached(tabId),
-      };
-      emitEvent("state.changed", full);
-      return full;
+      return switchConnectedTab(tabId);
     }
 
     case "tabs.disconnect": {
@@ -785,9 +800,18 @@ async function route(
     case "tabs.list":
       return listTabs(!!params.includeOthers);
 
-    case "tabs.navigate": {
-      const tab = await requireConnectedTab();
+    case "tabs.open": {
       const url = String(params.url);
+      return openAndConnectTab(url, params.active !== false);
+    }
+
+    case "tabs.navigate": {
+      const url = String(params.url);
+      const existingId = await getConnectedTabId();
+      if (existingId == null) {
+        return openAndConnectTab(url, true);
+      }
+      const tab = await requireConnectedTab();
       if (isRestrictedUrl(url)) {
         throw bridgeError(ErrorCodes.RESTRICTED_URL, "Cannot navigate to restricted URL.");
       }
@@ -795,7 +819,12 @@ async function route(
       await waitForLoad(tab.id!, "complete");
       const updated = await chrome.tabs.get(tab.id!);
       await pushState();
-      return { url: updated.url, title: updated.title };
+      return {
+        url: updated.url,
+        title: updated.title,
+        tabId: updated.id,
+        opened: false,
+      };
     }
 
     case "tabs.goBack": {
@@ -1392,120 +1421,6 @@ async function route(
   }
 }
 
-async function connectWs(): Promise<void> {
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  const port = await getPort();
-  await setBridgeStatus("reconnecting");
-
-  try {
-    let token = await getToken();
-    if (!token) {
-      token = await fetchHandshake(port);
-    }
-  } catch {
-    scheduleReconnect();
-    return;
-  }
-
-  intentionalClose = false;
-  const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-  socket = ws;
-
-  ws.addEventListener("open", () => {
-    void (async () => {
-      reconnectAttempt = 0;
-      await setBridgeStatus("connected");
-      await setLastError(null);
-      const token = await getToken();
-      ws.send(
-        JSON.stringify({
-          type: "hello",
-          protocolVersion: PROTOCOL_VERSION,
-          role: "extension",
-          token: token ?? undefined,
-        }),
-      );
-      await pushState();
-      startPing();
-    })();
-  });
-
-  ws.addEventListener("message", (ev) => {
-    void (async () => {
-      let msg: unknown;
-      try {
-        msg = JSON.parse(String(ev.data));
-      } catch {
-        return;
-      }
-      const m = msg as { type?: string };
-      if (m.type === "welcome") {
-        const w = m as { token: string; port: number };
-        await chrome.storage.local.set({
-          [STORAGE.token]: w.token,
-          [STORAGE.port]: w.port,
-        });
-        await pushState();
-        return;
-      }
-      if (m.type === "request") {
-        await handleRequest(m as RequestMessage);
-      }
-    })();
-  });
-
-  ws.addEventListener("close", () => {
-    stopPing();
-    if (socket === ws) socket = null;
-    void setBridgeStatus("disconnected");
-    if (!intentionalClose) scheduleReconnect();
-  });
-
-  ws.addEventListener("error", () => {
-    try {
-      ws.close();
-    } catch {
-      // ignore
-    }
-  });
-}
-
-function scheduleReconnect(): void {
-  if (reconnectTimer) return;
-  const delay = Math.min(30_000, 500 * 2 ** reconnectAttempt);
-  reconnectAttempt += 1;
-  void setBridgeStatus("reconnecting");
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connectWs();
-  }, delay);
-}
-
-function startPing(): void {
-  stopPing();
-  pingTimer = setInterval(() => {
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(
-        JSON.stringify({
-          type: "event",
-          event: "ping",
-          payload: { t: Date.now() },
-        }),
-      );
-    }
-  }, 20_000);
-}
-
-function stopPing(): void {
-  if (pingTimer) {
-    clearInterval(pingTimer);
-    pingTimer = null;
-  }
-}
-
 chrome.debugger.onEvent.addListener((source, method, params) => {
   handleDebuggerEvent(source, method, params as Record<string, unknown>);
 });
@@ -1598,21 +1513,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       if (msg.type === "getPopupState") {
-        const port = await getPort();
-        const storage = await chrome.storage.local.get([
-          STORAGE.bridgeStatus,
-          STORAGE.lastError,
-          STORAGE.port,
-        ]);
+        const port = (await getControllerPort()) ?? Number(DEFAULT_WS_PORT);
+        const storage = await chrome.storage.local.get(["lastError", "wsPort"]);
         const [active] = await chrome.tabs.query({
           active: true,
           currentWindow: true,
         });
         sendResponse({
           ok: true,
-          bridgeStatus: storage[STORAGE.bridgeStatus] ?? "disconnected",
-          lastError: storage[STORAGE.lastError] ?? null,
-          port: storage[STORAGE.port] ?? port,
+          bridgeStatus: summaryBridgeStatus(),
+          lastError: storage.lastError ?? null,
+          port: storage.wsPort ?? port,
+          pendingLabel: pendingControlLabel(),
           state: await currentState(),
           pinCount: pinCount(),
           activeTab: active
@@ -1670,22 +1582,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true, result });
         return;
       }
-      if (msg.type === "setPort") {
-        await chrome.storage.local.set({ [STORAGE.port]: Number(msg.port) });
-        intentionalClose = true;
-        socket?.close();
-        intentionalClose = false;
-        reconnectAttempt = 0;
-        void connectWs();
-        sendResponse({ ok: true });
+      if (msg.type === "listBridges") {
+        const bridges = await refreshBridges();
+        sendResponse({
+          ok: true,
+          bridges,
+          activePort: await getControllerPort(),
+          pendingLabel: pendingControlLabel(),
+        });
+        return;
+      }
+      if (msg.type === "setPort" || msg.type === "controlPort") {
+        const next = Number(msg.port);
+        if (!Number.isInteger(next) || next < 1 || next > 65535) {
+          sendResponse({ ok: false, error: "Invalid port." });
+          return;
+        }
+        const bridges = await setManualControl(next);
+        sendResponse({
+          ok: true,
+          bridges,
+          activePort: next,
+          pendingLabel: pendingControlLabel(),
+        });
         return;
       }
       if (msg.type === "reconnect") {
-        intentionalClose = true;
-        socket?.close();
-        intentionalClose = false;
-        reconnectAttempt = 0;
-        void connectWs();
+        await reconnectAll();
         sendResponse({ ok: true });
         return;
       }
@@ -1705,22 +1628,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
-    void connectWs();
+    void startHub();
   }
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
-  void connectWs();
+  void startHub();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
-  void connectWs();
+  void startHub();
 });
 
 void chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
-void connectWs();
+void startHub();
 void (async () => {
   const id = await getConnectedTabId();
   await updateBadge(id != null);

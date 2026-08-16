@@ -201,3 +201,89 @@ body {
   font-size: 10px;
   line-height: 1.4;
 }
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.panel-head .micro {
+  margin: 0;
+}
+
+.bridges {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  color: var(--text-faint);
+}
+
+.bridge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 4px 6px;
+}
+
+.bridge.controlling {
+  border-color: var(--accent);
+}
+
+.bridge.connected:not(.controlling) {
+  border-color: #4ec9b055;
+}
+
+.badge.connected {
+  background: var(--raised);
+  border: 1px solid var(--border);
+  color: var(--data);
+}
+
+.pending {
+  margin: 0 0 8px;
+  color: #cca700;
+  font-size: 10px;
+}
+
+.bridge-info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.bridge-port {
+  font-family: var(--mono);
+  color: var(--data);
+  font-size: 11px;
+}
+
+.bridge-meta {
+  color: var(--text-faint);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  flex: 0 0 auto;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 2px 5px;
+  border-radius: var(--r-sm);
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn.tiny {
+  padding: 2px 7px;
+  font-size: 10px;
+  flex: 0 0 auto;
+}

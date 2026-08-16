@@ -11,6 +11,7 @@ import {
 } from "./tools/helpers.js";
 import { getBridge } from "./ws-bridge.js";
 import {
+  CONTROL_REQUEST_TIMEOUT_MS,
   ErrorCodes,
   MAX_NETWORK_WAIT_FOR_MS,
   PICK_ELEMENT_TIMEOUT_MS,
@@ -42,11 +43,45 @@ export function createMcpServer(): McpServer {
     version: "0.1.0",
   });
 
+  // --- Control lease ---
+
+  server.tool(
+    "browser_request_control",
+    "Ask to become the instance that may mutate the Connected tab. Auto-grants if nobody holds control; otherwise shows a Chrome Allow/Deny notification.",
+    {},
+    async () =>
+      wrap(async () =>
+        textResult(
+          await callExt(
+            "control.request",
+            {},
+            CONTROL_REQUEST_TIMEOUT_MS + 5_000,
+          ),
+        ),
+      ),
+  );
+
+  server.tool(
+    "browser_release_control",
+    "Yield the control lease so another instance can auto-grant without a notification.",
+    {},
+    async () =>
+      wrap(async () => textResult(await callExt("control.release"))),
+  );
+
+  server.tool(
+    "browser_control_status",
+    "Who currently holds the browser control lease (port, name, whether this instance is controlling).",
+    {},
+    async () =>
+      wrap(async () => textResult(await callExt("control.status"))),
+  );
+
   // --- Automation ---
 
   server.tool(
     "browser_tabs",
-    "List the Connected tab and optionally other open tabs (read-only). Connecting tabs is done in the extension popup.",
+    "List the Connected tab and optionally other open tabs (read-only). Use browser_open to create and Connect a tab without the popup.",
     {
       includeOthers: z.boolean().optional().describe("Include other open tabs"),
     },
@@ -60,11 +95,31 @@ export function createMcpServer(): McpServer {
   );
 
   server.tool(
+    "browser_open",
+    "Open a URL in a new Chrome tab and Connect it for the agent. Does not require an existing Connected tab. Restricted URLs (chrome://, Web Store, …) are rejected.",
+    {
+      url: z.string().url().describe("Absolute URL to open"),
+      active: z
+        .boolean()
+        .optional()
+        .describe("Focus the new tab (default true)"),
+    },
+    async ({ url, active }) =>
+      wrap(async () =>
+        textResult(
+          await callExt("tabs.open", { url, active: active ?? true }, 45_000),
+        ),
+      ),
+  );
+
+  server.tool(
     "browser_navigate",
-    "Navigate the Connected tab to a URL.",
+    "Navigate the Connected tab to a URL. If no tab is Connected, opens a new tab and Connects it (same as browser_open).",
     { url: z.string().url().describe("Absolute URL to open") },
     async ({ url }) =>
-      wrap(async () => textResult(await callExt("tabs.navigate", { url }))),
+      wrap(async () =>
+        textResult(await callExt("tabs.navigate", { url }, 45_000)),
+      ),
   );
 
   server.tool(

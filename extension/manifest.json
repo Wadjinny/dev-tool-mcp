@@ -12,7 +12,8 @@
     "webNavigation",
     "activeTab",
     "cookies",
-    "alarms"
+    "alarms",
+    "notifications"
   ],
   "host_permissions": ["<all_urls>", "http://127.0.0.1/*"],
   "background": {

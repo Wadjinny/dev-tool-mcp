@@ -64,7 +64,7 @@ export async function requireConnectedTab(): Promise<chrome.tabs.Tab> {
   if (id == null) {
     throw bridgeError(
       ErrorCodes.NO_CONNECTED_TAB,
-      "No tab Connected in the extension popup.",
+      "No tab Connected. Call browser_open with a URL, or click Connect in the extension popup.",
     );
   }
   const tab = await getTab(id);

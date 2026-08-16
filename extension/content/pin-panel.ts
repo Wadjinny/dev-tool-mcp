@@ -2,6 +2,7 @@
  * Narrow right-edge panel listing pinned elements.
  */
 
+import { pinToUri, type PinDescriptor } from "@dev-tool-mcp/shared";
 import {
   clearPinElements,
   getPickMode,
@@ -13,13 +14,7 @@ import {
 } from "./pin-store.js";
 import { onPickModeChanged, pickerCancel } from "./picker.js";
 
-export type PanelPin = {
-  id: string;
-  tag: string;
-  role: string;
-  name: string;
-  selector: string | null;
-};
+export type PanelPin = PinDescriptor;
 
 const PANEL_ROOT_ID = "__dev_tool_mcp_pin_panel";
 const PANEL_HL_ID = "__dev_tool_mcp_pin_panel_hl";
@@ -198,6 +193,81 @@ function modeToggleButton(mode: PickMode, label: string, active: boolean): HTMLB
   return btn;
 }
 
+function iconButton(ariaLabel: string, glyph: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.setAttribute("aria-label", ariaLabel);
+  btn.title = ariaLabel;
+  btn.textContent = glyph;
+  Object.assign(btn.style, {
+    all: "unset",
+    flex: "0 0 auto",
+    width: "18px",
+    height: "18px",
+    lineHeight: "16px",
+    textAlign: "center",
+    borderRadius: "3px",
+    color: "#9d9d9d",
+    cursor: "pointer",
+    fontSize: glyph === "×" ? "14px" : "11px",
+    fontWeight: "700",
+  });
+  btn.addEventListener("mouseenter", () => {
+    btn.style.background = glyph === "×" ? "#3a1d1d" : "#2a2d2e";
+    btn.style.color = glyph === "×" ? "#f48771" : "#4ec9b0";
+  });
+  btn.addEventListener("mouseleave", () => {
+    btn.style.background = "transparent";
+    btn.style.color = "#9d9d9d";
+  });
+  return btn;
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      Object.assign(ta.style, {
+        position: "fixed",
+        left: "-9999px",
+        top: "0",
+      });
+      document.documentElement.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function asPanelPin(raw: Partial<PanelPin> & { id: string }): PanelPin {
+  const box = raw.box ?? { x: 0, y: 0, width: 0, height: 0 };
+  return {
+    id: raw.id,
+    tabId: typeof raw.tabId === "number" ? raw.tabId : 0,
+    url: raw.url ?? "",
+    tag: raw.tag ?? "",
+    role: raw.role ?? "",
+    name: raw.name ?? "",
+    selector: raw.selector ?? null,
+    box: {
+      x: box.x,
+      y: box.y,
+      width: box.width,
+      height: box.height,
+    },
+    createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+  };
+}
+
 function renderPanel(): void {
   if (panelPins.length === 0 && !isPicking()) {
     removePanelDom();
@@ -214,7 +284,7 @@ function renderPanel(): void {
       top: "12px",
       right: "8px",
       bottom: "12px",
-      width: "168px",
+      width: "196px",
       zIndex: "2147483646",
       display: "flex",
       flexDirection: "column",
@@ -330,31 +400,24 @@ function renderPanel(): void {
 
     meta.append(idLine, nameLine);
 
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.setAttribute("aria-label", `Remove ${pin.id}`);
-    removeBtn.textContent = "×";
-    Object.assign(removeBtn.style, {
-      all: "unset",
-      flex: "0 0 auto",
-      width: "18px",
-      height: "18px",
-      lineHeight: "16px",
-      textAlign: "center",
-      borderRadius: "3px",
-      color: "#9d9d9d",
-      cursor: "pointer",
-      fontSize: "14px",
-      fontWeight: "700",
+    const copyBtn = iconButton(`Copy ${pin.id}`, "⧉");
+    copyBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      void (async () => {
+        const uri = pinToUri(pin);
+        const ok = await copyText(uri);
+        const prev = copyBtn.textContent;
+        copyBtn.textContent = ok ? "✓" : "!";
+        copyBtn.style.color = ok ? "#4ec9b0" : "#f48771";
+        setTimeout(() => {
+          copyBtn.textContent = prev;
+          copyBtn.style.color = "#9d9d9d";
+        }, 900);
+      })();
     });
-    removeBtn.addEventListener("mouseenter", () => {
-      removeBtn.style.background = "#3a1d1d";
-      removeBtn.style.color = "#f48771";
-    });
-    removeBtn.addEventListener("mouseleave", () => {
-      removeBtn.style.background = "transparent";
-      removeBtn.style.color = "#9d9d9d";
-    });
+
+    const removeBtn = iconButton(`Remove ${pin.id}`, "×");
     removeBtn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -377,7 +440,7 @@ function renderPanel(): void {
       hideHighlight();
     });
 
-    row.append(meta, removeBtn);
+    row.append(meta, copyBtn, removeBtn);
     list.appendChild(row);
   }
 
@@ -388,8 +451,10 @@ export function refreshPinPanel(): void {
   renderPanel();
 }
 
-export function syncPinPanel(pins: PanelPin[]): { ok: true; count: number } {
-  panelPins = Array.isArray(pins) ? [...pins] : [];
+export function syncPinPanel(
+  pins: Array<Partial<PanelPin> & { id: string }>,
+): { ok: true; count: number } {
+  panelPins = Array.isArray(pins) ? pins.map(asPanelPin) : [];
   for (const pin of panelPins) {
     if (pin.selector) {
       try {

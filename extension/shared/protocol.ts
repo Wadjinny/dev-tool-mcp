@@ -1,8 +1,13 @@
 export {
   DEFAULT_WS_PORT,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  DISCOVERY_BASE_PORT,
+  DISCOVERY_PORT_COUNT,
   MAX_NETWORK_WAIT_FOR_MS,
   PROTOCOL_VERSION,
+  discoveryPorts,
+  type BridgeHealth,
+  type BridgeIdentity,
   emptyBridgeState,
   type BridgeState,
   type BridgeMessage,

@@ -14,6 +14,10 @@ export const ErrorCodes = {
   PICK_TIMEOUT: "PICK_TIMEOUT",
   PICK_IN_PROGRESS: "PICK_IN_PROGRESS",
   UNAUTHORIZED: "UNAUTHORIZED",
+  PORT_NOT_AUTHORIZED: "PORT_NOT_AUTHORIZED",
+  CONTROL_DENIED: "CONTROL_DENIED",
+  CONTROL_REQUEST_TIMEOUT: "CONTROL_REQUEST_TIMEOUT",
+  CONTROL_REQUEST_PENDING: "CONTROL_REQUEST_PENDING",
   UNKNOWN: "UNKNOWN",
 } as const;
 
@@ -32,7 +36,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   EXTENSION_DISCONNECTED:
     "Extension is not connected. Load the unpacked extension and ensure the MCP server is running.",
   NO_CONNECTED_TAB:
-    "No tab Connected in the extension popup. Open the dev-tool-mcp popup and click Connect on the target tab.",
+    "No tab Connected. Call browser_open with a URL, or click Connect in the extension popup.",
   TAB_GONE: "The Connected tab was closed.",
   RESTRICTED_URL:
     "This URL cannot be Connected (chrome://, extension pages, Web Store, etc.).",
@@ -49,5 +53,13 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PICK_TIMEOUT: "Element pick timed out before a selection was made.",
   PICK_IN_PROGRESS: "An element pick is already in progress.",
   UNAUTHORIZED: "Handshake token mismatch.",
+  PORT_NOT_AUTHORIZED:
+    "This bridge is not currently controlling the browser. Call browser_request_control (or retry a mutating tool) and Allow the Chrome notification.",
+  CONTROL_DENIED:
+    "The user denied this instance's request to control the browser.",
+  CONTROL_REQUEST_TIMEOUT:
+    "Timed out waiting for the user to Allow or Deny the control request.",
+  CONTROL_REQUEST_PENDING:
+    "Another instance already has a control request waiting for the user. Retry after that prompt is resolved.",
   UNKNOWN: "Unknown error.",
 };
