@@ -43,31 +43,72 @@ export type AttachDebuggerResult = {
   workerAttachErrors?: Array<WorkerAttachInfo & { error: string }>;
 };
 
-let attachedTabId: number | null = null;
-let bufferStartedAt: number | null = null;
-const consoleBuf: ConsoleMessage[] = [];
-const networkMap = new Map<string, NetworkEntry>();
-const networkOrder: string[] = [];
-/** CDP targetId → type for worker/iframe attribution. */
-const targetTypes = new Map<string, string>();
-/** Worker/shared/service worker targets we explicitly chrome.debugger.attach'd. */
-const attachedWorkerTargetIds = new Set<string>();
+/** Per-tab CDP session: each Connected tab (one per MCP session) has its own buffers. */
+type Session = {
+  tabId: number;
+  attached: boolean;
+  bufferStartedAt: number | null;
+  consoleBuf: ConsoleMessage[];
+  networkMap: Map<string, NetworkEntry>;
+  networkOrder: string[];
+  /** CDP targetId -> type for worker/iframe attribution. */
+  targetTypes: Map<string, string>;
+  /** Worker/shared/service worker targets we explicitly chrome.debugger.attach'd. */
+  workerIds: Set<string>;
+};
 
-type EventEmitter = (event: string, payload: unknown) => void;
+const sessions = new Map<number, Session>();
+/** Explicitly attached / auto-attached targetId -> owning tabId. */
+const targetOwner = new Map<string, number>();
+
+type EventEmitter = (event: string, payload: unknown, tabId: number) => void;
 let emitEvent: EventEmitter = () => {};
 
 export function setDebuggerEventEmitter(fn: EventEmitter): void {
   emitEvent = fn;
 }
 
-export function isDebuggerAttached(tabId?: number): boolean {
-  if (attachedTabId == null) return false;
-  if (tabId != null) return attachedTabId === tabId;
-  return true;
+function newSession(tabId: number): Session {
+  return {
+    tabId,
+    attached: false,
+    bufferStartedAt: null,
+    consoleBuf: [],
+    networkMap: new Map(),
+    networkOrder: [],
+    targetTypes: new Map(),
+    workerIds: new Set(),
+  };
 }
 
-export function getAttachedTabId(): number | null {
-  return attachedTabId;
+function sessionFor(tabId: number): Session {
+  let s = sessions.get(tabId);
+  if (!s) {
+    s = newSession(tabId);
+    sessions.set(tabId, s);
+  }
+  return s;
+}
+
+/** Read-only view; an absent session behaves like an empty, detached one. */
+function peekSession(tabId: number): Session {
+  return sessions.get(tabId) ?? newSession(tabId);
+}
+
+export function isDebuggerAttached(tabId: number): boolean {
+  return sessions.get(tabId)?.attached ?? false;
+}
+
+export function attachedTabIds(): number[] {
+  return [...sessions.values()].filter((s) => s.attached).map((s) => s.tabId);
+}
+
+/** Drop all capture state for a tab (tab closed / disconnected). */
+export async function forgetTab(tabId: number): Promise<void> {
+  if (isDebuggerAttached(tabId)) await detachDebugger(tabId);
+  const s = sessions.get(tabId);
+  if (s) for (const id of s.targetTypes.keys()) targetOwner.delete(id);
+  sessions.delete(tabId);
 }
 
 function originOf(url: string | undefined): string | null {
@@ -91,7 +132,7 @@ function isRelatedWorkerTarget(
 }
 
 async function attachExistingWorkers(
-  tabId: number,
+  s: Session,
   tabUrl: string,
 ): Promise<{
   workersAttached: WorkerAttachInfo[];
@@ -109,13 +150,11 @@ async function attachExistingWorkers(
   }
 
   for (const t of targets) {
-    if (!isRelatedWorkerTarget(t, tabId, pageOrigin)) continue;
-    if (attachedWorkerTargetIds.has(t.id)) {
-      workersAttached.push({
-        targetId: t.id,
-        type: t.type,
-        url: t.url ?? "",
-      });
+    if (!isRelatedWorkerTarget(t, s.tabId, pageOrigin)) continue;
+    const owner = targetOwner.get(t.id);
+    if (s.workerIds.has(t.id) || (owner != null && owner !== s.tabId)) {
+      // Already ours, or a shared worker already captured for another tab.
+      workersAttached.push({ targetId: t.id, type: t.type, url: t.url ?? "" });
       continue;
     }
 
@@ -124,16 +163,13 @@ async function attachExistingWorkers(
       // does not tear down flatten auto-attach sessions.
       if (!t.attached) {
         await chrome.debugger.attach({ targetId: t.id }, DEBUGGER_VERSION);
-        attachedWorkerTargetIds.add(t.id);
+        s.workerIds.add(t.id);
       }
-      targetTypes.set(t.id, t.type);
+      s.targetTypes.set(t.id, t.type);
+      targetOwner.set(t.id, s.tabId);
       await sendCdpToTarget(t.id, "Network.enable", {});
       await sendCdpToTarget(t.id, "Runtime.enable", {});
-      workersAttached.push({
-        targetId: t.id,
-        type: t.type,
-        url: t.url ?? "",
-      });
+      workersAttached.push({ targetId: t.id, type: t.type, url: t.url ?? "" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       workerAttachErrors.push({
@@ -148,11 +184,12 @@ async function attachExistingWorkers(
   return { workersAttached, workerAttachErrors };
 }
 
-async function detachWorkerTargets(): Promise<void> {
-  const ids = [...attachedWorkerTargetIds];
-  attachedWorkerTargetIds.clear();
+async function detachWorkerTargets(s: Session): Promise<void> {
+  const ids = [...s.workerIds];
+  s.workerIds.clear();
   for (const id of ids) {
-    targetTypes.delete(id);
+    s.targetTypes.delete(id);
+    targetOwner.delete(id);
     try {
       await chrome.debugger.detach({ targetId: id });
     } catch {
@@ -172,50 +209,43 @@ export async function attachDebugger(
     // ignore
   }
 
-  if (attachedTabId === tabId) {
-    const { workersAttached, workerAttachErrors } =
-      await attachExistingWorkers(tabId, tabUrl);
-    return {
-      attached: true,
-      workersAttached,
-      ...(workerAttachErrors.length ? { workerAttachErrors } : {}),
-    };
-  }
-  if (attachedTabId != null && attachedTabId !== tabId) {
-    await detachDebugger();
-  }
-
-  try {
-    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-  } catch (err) {
-    const message =
-      err instanceof Error ? err.message : String(err);
-    throw bridgeError(
-      ErrorCodes.DEBUGGER_ATTACH_FAILED,
-      `Failed to attach debugger. Close DevTools on that tab and retry. (${message})`,
-    );
-  }
-
-  attachedTabId = tabId;
-  bufferStartedAt = Date.now();
-  targetTypes.set(`tab:${tabId}`, "page");
-  try {
-    await sendCdp(tabId, "Runtime.enable", {});
-    await sendCdp(tabId, "Console.enable", {});
-    await sendCdp(tabId, "Network.enable", {});
-    await sendCdp(tabId, "Page.enable", {});
-    // Auto-attach *new* workers; existing ones are attached below via getTargets.
-    await sendCdp(tabId, "Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-    });
-  } catch {
-    // domains may partially fail; keep attach
+  const s = sessionFor(tabId);
+  if (!s.attached) {
+    try {
+      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // After a service-worker restart Chrome may still hold our session.
+      if (!/already attached/i.test(message)) {
+        throw bridgeError(
+          ErrorCodes.DEBUGGER_ATTACH_FAILED,
+          `Failed to attach debugger. Close DevTools on that tab and retry. (${message})`,
+        );
+      }
+    }
+    s.attached = true;
+    s.bufferStartedAt = Date.now();
+    s.targetTypes.set(`tab:${tabId}`, "page");
+    try {
+      await sendCdp(tabId, "Runtime.enable", {});
+      await sendCdp(tabId, "Console.enable", {});
+      await sendCdp(tabId, "Network.enable", {});
+      await sendCdp(tabId, "Page.enable", {});
+      // Auto-attach *new* workers; existing ones are attached below via getTargets.
+      await sendCdp(tabId, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      });
+    } catch {
+      // domains may partially fail; keep attach
+    }
   }
 
-  const { workersAttached, workerAttachErrors } =
-    await attachExistingWorkers(tabId, tabUrl);
+  const { workersAttached, workerAttachErrors } = await attachExistingWorkers(
+    s,
+    tabUrl,
+  );
   return {
     attached: true,
     workersAttached,
@@ -223,13 +253,19 @@ export async function attachDebugger(
   };
 }
 
-export async function detachDebugger(): Promise<{ attached: boolean }> {
-  const tabId = attachedTabId;
-  await detachWorkerTargets();
-  attachedTabId = null;
-  bufferStartedAt = null;
-  targetTypes.clear();
-  if (tabId != null) {
+/** Detach CDP from a tab. Buffers are kept (post-mortem reads) until forgetTab. */
+export async function detachDebugger(
+  tabId: number,
+): Promise<{ attached: boolean }> {
+  const s = sessions.get(tabId);
+  if (!s) return { attached: false };
+  await detachWorkerTargets(s);
+  const wasAttached = s.attached;
+  s.attached = false;
+  s.bufferStartedAt = null;
+  for (const id of s.targetTypes.keys()) targetOwner.delete(id);
+  s.targetTypes.clear();
+  if (wasAttached) {
     try {
       await chrome.debugger.detach({ tabId });
     } catch {
@@ -239,12 +275,12 @@ export async function detachDebugger(): Promise<{ attached: boolean }> {
   return { attached: false };
 }
 
-export async function listDebuggerTargets(): Promise<{
+export async function listDebuggerTargets(tabId: number): Promise<{
   targets: DebuggerTargetInfo[];
   debuggerAttached: boolean;
 }> {
-  const tabId = attachedTabId;
-  if (tabId == null) {
+  const s = sessions.get(tabId);
+  if (!s?.attached) {
     return { targets: [], debuggerAttached: false };
   }
 
@@ -277,7 +313,7 @@ export async function listDebuggerTargets(): Promise<{
           url: t.url ?? tabUrl,
           title: t.title,
           tabId: t.tabId,
-          attached: !!t.attached || attachedTabId === tabId,
+          attached: true,
         };
         continue;
       }
@@ -289,9 +325,7 @@ export async function listDebuggerTargets(): Promise<{
         title: t.title,
         tabId: t.tabId,
         attached:
-          attachedWorkerTargetIds.has(t.id) ||
-          targetTypes.has(t.id) ||
-          !!t.attached,
+          s.workerIds.has(t.id) || s.targetTypes.has(t.id) || !!t.attached,
       });
     }
   } catch {
@@ -343,14 +377,18 @@ async function sendCdpToTarget(
   }
 }
 
-export function listConsole(clear?: boolean): { messages: ConsoleMessage[] } {
-  const messages = [...consoleBuf];
-  if (clear) consoleBuf.length = 0;
+export function listConsole(
+  tabId: number,
+  clear?: boolean,
+): { messages: ConsoleMessage[] } {
+  const s = peekSession(tabId);
+  const messages = [...s.consoleBuf];
+  if (clear) s.consoleBuf.length = 0;
   return { messages };
 }
 
-export function clearConsole(): { ok: true } {
-  consoleBuf.length = 0;
+export function clearConsole(tabId: number): { ok: true } {
+  peekSession(tabId).consoleBuf.length = 0;
   return { ok: true };
 }
 
@@ -473,14 +511,19 @@ function projectEntry(
   return out;
 }
 
-export function listNetwork(filter: NetworkListFilter = {}): {
+export function listNetwork(
+  tabId: number,
+  filter: NetworkListFilter = {},
+): {
   requests: NetworkEntry[];
   bufferStartedAt: number | null;
   debuggerAttached: boolean;
   note?: string;
 } {
-  let requests = networkOrder
-    .map((id) => networkMap.get(id))
+  const s = peekSession(tabId);
+  const { bufferStartedAt } = s;
+  let requests = s.networkOrder
+    .map((id) => s.networkMap.get(id))
     .filter((x): x is NetworkEntry => !!x)
     .filter((r) => matchesFilter(r, filter));
 
@@ -495,7 +538,7 @@ export function listNetwork(filter: NetworkListFilter = {}): {
   );
 
   const note =
-    attachedTabId == null
+    !s.attached
       ? "Debugger not attached; buffer is inactive until attach."
       : projected.length === 0
         ? `Buffer empty or no matches. Capture starts at attach (bufferStartedAt=${bufferStartedAt}). Existing workers are attached via chrome.debugger.getTargets; new workers via Target.setAutoAttach. Use waitForMs or re-trigger the request.`
@@ -504,9 +547,36 @@ export function listNetwork(filter: NetworkListFilter = {}): {
   return {
     requests: projected,
     bufferStartedAt,
-    debuggerAttached: attachedTabId != null,
+    debuggerAttached: s.attached,
     note,
   };
+}
+
+const ID_SEGMENT =
+  /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$/i;
+const HASHED_ASSET = /^(.+?)[.-]([0-9a-f]{8,}|[A-Za-z0-9_-]{8,}\d[A-Za-z0-9_-]*)\.([a-z0-9]{1,5})$/i;
+
+/**
+ * Collapse id-like path segments (numbers, UUIDs, long hex / base64 tokens)
+ * to ":id" so "/item/123" and "/item/456" aggregate together.
+ */
+export function normalizePath(pathname: string): string {
+  return pathname
+    .split("/")
+    .map((seg) => {
+      if (!seg) return seg;
+      let decoded = seg;
+      try {
+        decoded = decodeURIComponent(seg);
+      } catch {
+        // keep raw
+      }
+      if (ID_SEGMENT.test(decoded)) return ":id";
+      const asset = HASHED_ASSET.exec(decoded);
+      if (asset && /\d/.test(asset[2]!)) return `${asset[1]}.*.${asset[3]}`;
+      return seg;
+    })
+    .join("/");
 }
 
 export type NetworkSummary = {
@@ -530,15 +600,19 @@ export type NetworkSummary = {
   }>;
 };
 
-export function listNetworkSummary(opts: {
-  since?: number;
-  limitHosts?: number;
-  limitPaths?: number;
-} = {}): NetworkSummary {
-  const limitHosts = opts.limitHosts ?? 40;
-  const limitPaths = opts.limitPaths ?? 40;
-  const entries = networkOrder
-    .map((id) => networkMap.get(id))
+export function listNetworkSummary(
+  tabId: number,
+  opts: {
+    since?: number;
+    limitHosts?: number;
+    limitPaths?: number;
+  } = {},
+): NetworkSummary {
+  const s = peekSession(tabId);
+  const limitHosts = opts.limitHosts ?? 15;
+  const limitPaths = opts.limitPaths ?? 15;
+  const entries = s.networkOrder
+    .map((id) => s.networkMap.get(id))
     .filter((x): x is NetworkEntry => !!x)
     .filter((r) => (opts.since != null ? r.timestamp >= opts.since : true));
 
@@ -567,7 +641,7 @@ export function listNetworkSummary(opts: {
       const u = new URL(r.url);
       host = u.host;
       origin = u.origin;
-      pathPrefix = u.pathname || "/";
+      pathPrefix = normalizePath(u.pathname || "/");
     } catch {
       // keep defaults
     }
@@ -615,8 +689,8 @@ export function listNetworkSummary(opts: {
     .slice(0, limitPaths);
 
   return {
-    bufferStartedAt,
-    debuggerAttached: attachedTabId != null,
+    bufferStartedAt: s.bufferStartedAt,
+    debuggerAttached: s.attached,
     total: entries.length,
     byHost,
     byTargetType,
@@ -625,11 +699,16 @@ export function listNetworkSummary(opts: {
   };
 }
 
-export function getNetworkEntry(requestId: string): {
+export function getNetworkEntry(
+  tabId: number,
+  requestId: string,
+): {
   request: NetworkEntry | null;
   bufferStartedAt: number | null;
 } {
-  const entry = networkMap.get(requestId) ?? null;
+  const s = peekSession(tabId);
+  const { bufferStartedAt } = s;
+  const entry = s.networkMap.get(requestId) ?? null;
   return {
     request: entry
       ? projectEntry(entry, {
@@ -646,6 +725,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function waitForNetwork(
+  tabId: number,
   filter: NetworkListFilter,
   waitForMs: number,
 ): Promise<{
@@ -660,14 +740,14 @@ export async function waitForNetwork(
   const deadline = Date.now() + Math.max(0, waitForMs);
 
   while (Date.now() <= deadline) {
-    const listed = listNetwork(effective);
+    const listed = listNetwork(tabId, effective);
     if (listed.requests.length > 0) {
       return { ...listed, timedOut: false };
     }
     await sleep(150);
   }
 
-  const listed = listNetwork(effective);
+  const listed = listNetwork(tabId, effective);
   return {
     ...listed,
     timedOut: true,
@@ -690,14 +770,17 @@ export async function getResponseBody(
   return result;
 }
 
-function resolveTargetMeta(source: chrome.debugger.Debuggee): {
+function resolveTargetMeta(
+  s: Session,
+  source: chrome.debugger.Debuggee,
+): {
   targetId?: string;
   targetType: string;
 } {
   if (source.targetId) {
     return {
       targetId: source.targetId,
-      targetType: targetTypes.get(source.targetId) ?? "other",
+      targetType: s.targetTypes.get(source.targetId) ?? "other",
     };
   }
   if (source.tabId != null) {
@@ -709,24 +792,29 @@ function resolveTargetMeta(source: chrome.debugger.Debuggee): {
   return { targetType: "page" };
 }
 
-function upsertNetwork(entry: NetworkEntry): void {
-  const isNew = !networkMap.has(entry.id);
-  networkMap.set(entry.id, entry);
+function upsertNetwork(s: Session, entry: NetworkEntry): void {
+  const isNew = !s.networkMap.has(entry.id);
+  s.networkMap.set(entry.id, entry);
   if (isNew) {
-    networkOrder.push(entry.id);
-    trimNetwork();
+    s.networkOrder.push(entry.id);
+    trimNetwork(s);
   }
 }
 
-function pushWsMessage(requestId: string, msg: WebSocketMessageEntry): void {
-  const prev = networkMap.get(requestId);
+function pushWsMessage(
+  s: Session,
+  requestId: string,
+  msg: WebSocketMessageEntry,
+): void {
+  const prev = s.networkMap.get(requestId);
   if (!prev) return;
   const messages = [...(prev.webSocketMessages ?? []), msg];
   while (messages.length > WS_MSG_RING) messages.shift();
-  networkMap.set(requestId, { ...prev, webSocketMessages: messages });
+  s.networkMap.set(requestId, { ...prev, webSocketMessages: messages });
 }
 
 async function handleAttachedToTarget(
+  s: Session,
   source: chrome.debugger.Debuggee,
   p: Record<string, unknown>,
 ): Promise<void> {
@@ -736,16 +824,16 @@ async function handleAttachedToTarget(
   const targetId = info?.targetId;
   const type = String(info?.type ?? "other");
   if (targetId) {
-    targetTypes.set(targetId, type);
+    s.targetTypes.set(targetId, type);
+    targetOwner.set(targetId, s.tabId);
   }
 
   const waiting = !!p.waitingForDebugger;
-  const tabId = source.tabId ?? attachedTabId;
+  const tabId = source.tabId ?? s.tabId;
 
   // Prefer targetId commands for workers; fall back to tab session (flatten).
   if (targetId && /worker/i.test(type)) {
     // Flatten auto-attach: enable Network on the nested session (no separate attach).
-    targetTypes.set(targetId, type);
     await sendCdpToTarget(targetId, "Network.enable", {});
     await sendCdpToTarget(targetId, "Runtime.enable", {});
     if (waiting) {
@@ -760,37 +848,44 @@ async function handleAttachedToTarget(
   }
 }
 
+function sessionForSource(source: chrome.debugger.Debuggee): Session | null {
+  if (source.tabId != null) {
+    const s = sessions.get(source.tabId);
+    return s?.attached ? s : null;
+  }
+  if (source.targetId) {
+    const owner = targetOwner.get(source.targetId);
+    if (owner == null) return null;
+    const s = sessions.get(owner);
+    return s?.attached ? s : null;
+  }
+  return null;
+}
+
 export function handleDebuggerEvent(
   source: chrome.debugger.Debuggee,
   method: string,
   params?: Record<string, unknown>,
 ): void {
-  const onAttachedTab =
-    source.tabId != null && source.tabId === attachedTabId;
-  const onKnownTarget =
-    !!source.targetId && targetTypes.has(source.targetId);
-  if (!onAttachedTab && !onKnownTarget) {
-    // Still accept Target.attachedToTarget for our tab.
-    if (
-      method !== "Target.attachedToTarget" ||
-      source.tabId == null ||
-      source.tabId !== attachedTabId
-    ) {
-      return;
-    }
-  }
+  const s = sessionForSource(source);
+  if (!s) return;
+  const emit = (event: string, payload: unknown) =>
+    emitEvent(event, payload, s.tabId);
 
   const p = params ?? {};
-  const { targetId, targetType } = resolveTargetMeta(source);
+  const { targetId, targetType } = resolveTargetMeta(s, source);
 
   if (method === "Target.attachedToTarget") {
-    void handleAttachedToTarget(source, p);
+    void handleAttachedToTarget(s, source, p);
     return;
   }
 
   if (method === "Target.detachedFromTarget") {
     const id = String(p.targetId ?? source.targetId ?? "");
-    if (id) targetTypes.delete(id);
+    if (id) {
+      s.targetTypes.delete(id);
+      targetOwner.delete(id);
+    }
     return;
   }
 
@@ -809,8 +904,8 @@ export function handleDebuggerEvent(
       lineNumber: m.line,
       timestamp: m.timestamp ?? Date.now(),
     };
-    pushRing(consoleBuf, entry);
-    emitEvent("console.message", entry);
+    pushRing(s.consoleBuf, entry);
+    emit("console.message", entry);
     return;
   }
 
@@ -828,8 +923,8 @@ export function handleDebuggerEvent(
       text,
       timestamp: Number(p.timestamp ?? Date.now()),
     };
-    pushRing(consoleBuf, entry);
-    emitEvent("console.message", entry);
+    pushRing(s.consoleBuf, entry);
+    emit("console.message", entry);
     return;
   }
 
@@ -841,7 +936,7 @@ export function handleDebuggerEvent(
       headers?: Record<string, string>;
       postData?: string;
     };
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     const entry: NetworkEntry = {
       id: requestId,
       url: request?.url ?? prev?.url ?? "",
@@ -863,17 +958,17 @@ export function handleDebuggerEvent(
       fromCache: prev?.fromCache,
       webSocketMessages: prev?.webSocketMessages,
     };
-    upsertNetwork(entry);
-    emitEvent("network.request", projectEntry(entry, {}));
+    upsertNetwork(s, entry);
+    emit("network.request", projectEntry(entry, {}));
     return;
   }
 
   if (method === "Network.requestServedFromCache") {
     const requestId = String(p.requestId ?? "");
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     if (!prev) return;
     const entry: NetworkEntry = { ...prev, fromCache: true };
-    upsertNetwork(entry);
+    upsertNetwork(s, entry);
     return;
   }
 
@@ -892,7 +987,7 @@ export function handleDebuggerEvent(
       remoteIPAddress?: string;
       encodedDataLength?: number;
     };
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     const entry: NetworkEntry = {
       id: requestId,
       url: response?.url ?? prev?.url ?? "",
@@ -923,14 +1018,14 @@ export function handleDebuggerEvent(
       errorText: prev?.errorText,
       finished: prev?.finished,
     };
-    upsertNetwork(entry);
-    emitEvent("network.response", projectEntry(entry, {}));
+    upsertNetwork(s, entry);
+    emit("network.response", projectEntry(entry, {}));
     return;
   }
 
   if (method === "Network.loadingFinished") {
     const requestId = String(p.requestId ?? "");
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     if (!prev) return;
     const entry: NetworkEntry = {
       ...prev,
@@ -940,13 +1035,13 @@ export function handleDebuggerEvent(
           ? p.encodedDataLength
           : prev.encodedDataLength,
     };
-    upsertNetwork(entry);
+    upsertNetwork(s, entry);
     return;
   }
 
   if (method === "Network.loadingFailed") {
     const requestId = String(p.requestId ?? "");
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     const entry: NetworkEntry = {
       id: requestId,
       url: prev?.url ?? "",
@@ -964,8 +1059,8 @@ export function handleDebuggerEvent(
       fromCache: prev?.fromCache,
       webSocketMessages: prev?.webSocketMessages,
     };
-    upsertNetwork(entry);
-    emitEvent("network.response", projectEntry(entry, {}));
+    upsertNetwork(s, entry);
+    emit("network.response", projectEntry(entry, {}));
     return;
   }
 
@@ -983,17 +1078,17 @@ export function handleDebuggerEvent(
       resourceKind: "websocket",
       webSocketMessages: [],
     };
-    upsertNetwork(entry);
-    emitEvent("network.request", projectEntry(entry, {}));
+    upsertNetwork(s, entry);
+    emit("network.request", projectEntry(entry, {}));
     return;
   }
 
   if (method === "Network.webSocketWillSendHandshakeRequest") {
     const requestId = String(p.requestId ?? "");
     const request = p.request as { headers?: Record<string, string> };
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     if (!prev) return;
-    upsertNetwork({
+    upsertNetwork(s, {
       ...prev,
       requestHeaders: headersToRecord(request?.headers) ?? prev.requestHeaders,
       resourceKind: "websocket",
@@ -1008,7 +1103,7 @@ export function handleDebuggerEvent(
       status?: number;
       headers?: Record<string, string>;
     };
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     if (!prev) return;
     const entry: NetworkEntry = {
       ...prev,
@@ -1018,8 +1113,8 @@ export function handleDebuggerEvent(
       resourceKind: "websocket",
       type: "WebSocket",
     };
-    upsertNetwork(entry);
-    emitEvent("network.response", projectEntry(entry, {}));
+    upsertNetwork(s, entry);
+    emit("network.response", projectEntry(entry, {}));
     return;
   }
 
@@ -1032,7 +1127,7 @@ export function handleDebuggerEvent(
       opcode?: number;
       payloadData?: string;
     };
-    pushWsMessage(requestId, {
+    pushWsMessage(s, requestId, {
       opcode: Number(response?.opcode ?? 1),
       data: truncate(String(response?.payloadData ?? ""), WS_DATA_MAX),
       direction: method.endsWith("Sent") ? "sent" : "received",
@@ -1043,27 +1138,33 @@ export function handleDebuggerEvent(
 
   if (method === "Network.webSocketClosed") {
     const requestId = String(p.requestId ?? "");
-    const prev = networkMap.get(requestId);
+    const prev = s.networkMap.get(requestId);
     if (!prev) return;
-    upsertNetwork({ ...prev, finished: true, resourceKind: "websocket" });
+    upsertNetwork(s, { ...prev, finished: true, resourceKind: "websocket" });
   }
 }
 
 export function handleDebuggerDetach(source: chrome.debugger.Debuggee): void {
-  if (source.targetId && attachedWorkerTargetIds.has(source.targetId)) {
-    attachedWorkerTargetIds.delete(source.targetId);
-    targetTypes.delete(source.targetId);
+  if (source.targetId) {
+    const owner = targetOwner.get(source.targetId);
+    targetOwner.delete(source.targetId);
+    const s = owner != null ? sessions.get(owner) : undefined;
+    if (s) {
+      s.workerIds.delete(source.targetId);
+      s.targetTypes.delete(source.targetId);
+    }
     return;
   }
-  if (source.tabId != null && source.tabId === attachedTabId) {
-    const tabId = source.tabId;
-    attachedTabId = null;
-    bufferStartedAt = null;
-    // Best-effort cleanup of explicit worker sessions (async).
-    void detachWorkerTargets();
-    targetTypes.clear();
-    emitEvent("debugger.detached", { tabId });
-  }
+  if (source.tabId == null) return;
+  const s = sessions.get(source.tabId);
+  if (!s?.attached) return;
+  s.attached = false;
+  s.bufferStartedAt = null;
+  // Best-effort cleanup of explicit worker sessions (async).
+  void detachWorkerTargets(s);
+  for (const id of s.targetTypes.keys()) targetOwner.delete(id);
+  s.targetTypes.clear();
+  emitEvent("debugger.detached", { tabId: s.tabId }, s.tabId);
 }
 
 function pushRing<T>(buf: T[], item: T): void {
@@ -1071,9 +1172,9 @@ function pushRing<T>(buf: T[], item: T): void {
   if (buf.length > RING) buf.splice(0, buf.length - RING);
 }
 
-function trimNetwork(): void {
-  while (networkOrder.length > RING) {
-    const id = networkOrder.shift();
-    if (id) networkMap.delete(id);
+function trimNetwork(s: Session): void {
+  while (s.networkOrder.length > RING) {
+    const id = s.networkOrder.shift();
+    if (id) s.networkMap.delete(id);
   }
 }

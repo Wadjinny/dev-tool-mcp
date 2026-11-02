@@ -5,8 +5,6 @@ import {
   type TabInfo,
 } from "@dev-tool-mcp/shared";
 
-const STORAGE_KEY = "connectedTabId";
-
 export function isRestrictedUrl(url: string | undefined | null): boolean {
   if (!url) return true;
   const lower = url.toLowerCase();
@@ -37,18 +35,114 @@ export function isRestrictedUrl(url: string | undefined | null): boolean {
   return false;
 }
 
-export async function getConnectedTabId(): Promise<number | null> {
-  const data = await chrome.storage.local.get(STORAGE_KEY);
-  const id = data[STORAGE_KEY];
-  return typeof id === "number" ? id : null;
+/**
+ * Tab ownership: every MCP session (bridge port) owns at most one Connected
+ * tab. Sessions act only on their own tab, so several agents can work in
+ * parallel without fighting over a global lease.
+ */
+export type TabOwner = {
+  port: number;
+  /** Bridge process start time; guards against a new instance reusing the port. */
+  startedAt: number | null;
+};
+
+const OWNERS_KEY = "tabOwners";
+const LEGACY_KEY = "connectedTabId";
+
+let ownersPromise: Promise<Map<number, TabOwner>> | null = null;
+
+type OwnerListener = (
+  tabId: number,
+  prev: TabOwner | null,
+  next: TabOwner | null,
+) => Promise<void>;
+let ownerListener: OwnerListener = async () => {};
+
+export function onTabOwnerChanged(fn: OwnerListener): void {
+  ownerListener = fn;
 }
 
-export async function setConnectedTabId(tabId: number | null): Promise<void> {
-  if (tabId == null) {
-    await chrome.storage.local.remove(STORAGE_KEY);
-  } else {
-    await chrome.storage.local.set({ [STORAGE_KEY]: tabId });
+function owners(): Promise<Map<number, TabOwner>> {
+  ownersPromise ??= (async () => {
+    const data = await chrome.storage.local.get([OWNERS_KEY, LEGACY_KEY]);
+    const raw = (data[OWNERS_KEY] ?? {}) as Record<string, TabOwner>;
+    const map = new Map<number, TabOwner>();
+    for (const [k, v] of Object.entries(raw)) {
+      if (v && typeof v.port === "number") map.set(Number(k), v);
+    }
+    // Pre-multi-tab single connection had no owner; drop it.
+    if (data[LEGACY_KEY] != null) await chrome.storage.local.remove(LEGACY_KEY);
+    return map;
+  })();
+  return ownersPromise;
+}
+
+async function persist(map: Map<number, TabOwner>): Promise<void> {
+  await chrome.storage.local.set({
+    [OWNERS_KEY]: Object.fromEntries(
+      [...map].map(([id, o]) => [String(id), o]),
+    ),
+  });
+}
+
+export function sameOwner(a: TabOwner | null, b: TabOwner | null): boolean {
+  if (!a || !b) return a === b;
+  return (
+    a.port === b.port &&
+    (a.startedAt == null || b.startedAt == null || a.startedAt === b.startedAt)
+  );
+}
+
+export async function getTabOwner(tabId: number): Promise<TabOwner | null> {
+  return (await owners()).get(tabId) ?? null;
+}
+
+export async function listOwnedTabs(): Promise<Array<[number, TabOwner]>> {
+  return [...(await owners())];
+}
+
+/** The tab owned by this session, if any. */
+export async function tabIdForOwner(owner: TabOwner): Promise<number | null> {
+  for (const [tabId, o] of await owners()) {
+    if (sameOwner(o, owner)) return tabId;
   }
+  return null;
+}
+
+/**
+ * Single choke point for connect / disconnect / auto-disconnect. Giving a tab
+ * to a session releases that session's previous tab (one tab per session).
+ */
+export async function setTabOwner(
+  tabId: number,
+  next: TabOwner | null,
+): Promise<void> {
+  const map = await owners();
+  const prev = map.get(tabId) ?? null;
+  const released: Array<[number, TabOwner]> = [];
+  if (next) {
+    for (const [id, o] of map) {
+      if (id !== tabId && o.port === next.port) released.push([id, o]);
+    }
+    for (const [id] of released) map.delete(id);
+    map.set(tabId, next);
+  } else {
+    map.delete(tabId);
+  }
+  await persist(map);
+  for (const [id, old] of released) await ownerListener(id, old, null);
+  if (prev?.port !== next?.port || prev?.startedAt !== next?.startedAt) {
+    await ownerListener(tabId, prev, next);
+  }
+}
+
+/** Release every tab owned by a port (bridge went away for good). */
+export async function releaseTabsOfPort(port: number): Promise<number[]> {
+  const ids = [...(await owners())]
+    .filter(([, o]) => o.port === port)
+    .map(([id]) => id);
+  for (const id of ids) await setTabOwner(id, null);
+  return ids;
 }
 
 export async function getTab(tabId: number): Promise<chrome.tabs.Tab | null> {
@@ -59,21 +153,21 @@ export async function getTab(tabId: number): Promise<chrome.tabs.Tab | null> {
   }
 }
 
-export async function requireConnectedTab(): Promise<chrome.tabs.Tab> {
-  const id = await getConnectedTabId();
+export async function requireTabFor(owner: TabOwner): Promise<chrome.tabs.Tab> {
+  const id = await tabIdForOwner(owner);
   if (id == null) {
     throw bridgeError(
       ErrorCodes.NO_CONNECTED_TAB,
-      "No tab Connected. Call browser_open with a URL, or click Connect in the extension popup.",
+      "This session has no Connected tab. Call browser_open with a URL, browser_connect_tab with a tabId from browser_tabs, or click Connect in the extension popup.",
     );
   }
   const tab = await getTab(id);
   if (!tab) {
-    await setConnectedTabId(null);
+    await setTabOwner(id, null);
     throw bridgeError(ErrorCodes.TAB_GONE, "The Connected tab was closed.");
   }
   if (isRestrictedUrl(tab.url)) {
-    await setConnectedTabId(null);
+    await setTabOwner(id, null);
     throw bridgeError(
       ErrorCodes.RESTRICTED_URL,
       "Connected tab navigated to a restricted URL.",
@@ -82,7 +176,7 @@ export async function requireConnectedTab(): Promise<chrome.tabs.Tab> {
   return tab;
 }
 
-export async function connectTab(tabId: number): Promise<BridgeState> {
+export async function assertConnectable(tabId: number): Promise<chrome.tabs.Tab> {
   const tab = await getTab(tabId);
   if (!tab) {
     throw bridgeError(ErrorCodes.TAB_GONE, "Tab not found.");
@@ -93,43 +187,23 @@ export async function connectTab(tabId: number): Promise<BridgeState> {
       "This URL cannot be Connected (chrome://, extension pages, Web Store, etc.).",
     );
   }
-  await setConnectedTabId(tabId);
-  await updateBadge(true);
-  return buildState(true, true);
-}
-
-export async function disconnectTab(): Promise<BridgeState> {
-  await setConnectedTabId(null);
-  await updateBadge(false);
-  return buildState(true, false);
+  return tab;
 }
 
 export async function buildState(
   extensionConnected: boolean,
-  _unused?: boolean,
+  tabId: number | null,
 ): Promise<BridgeState> {
-  const id = await getConnectedTabId();
-  if (id == null) {
-    return {
-      extensionConnected,
-      connectedTabId: null,
-      connectedTabUrl: null,
-      connectedTabTitle: null,
-      debuggerAttached: false,
-    };
-  }
-  const tab = await getTab(id);
-  if (!tab) {
-    await setConnectedTabId(null);
-    await updateBadge(false);
-    return {
-      extensionConnected,
-      connectedTabId: null,
-      connectedTabUrl: null,
-      connectedTabTitle: null,
-      debuggerAttached: false,
-    };
-  }
+  const empty: BridgeState = {
+    extensionConnected,
+    connectedTabId: null,
+    connectedTabUrl: null,
+    connectedTabTitle: null,
+    debuggerAttached: false,
+  };
+  if (tabId == null) return empty;
+  const tab = await getTab(tabId);
+  if (!tab) return empty;
   return {
     extensionConnected,
     connectedTabId: tab.id ?? null,
@@ -139,32 +213,34 @@ export async function buildState(
   };
 }
 
-export async function updateBadge(on: boolean): Promise<void> {
-  await chrome.action.setBadgeText({ text: on ? "ON" : "" });
-  if (on) {
-    await chrome.action.setBadgeBackgroundColor({ color: "#0e639c" });
-  }
-}
-
-export async function listTabs(includeOthers: boolean): Promise<{
+export async function listTabs(
+  owner: TabOwner,
+  includeOthers: boolean,
+  labelFor: (port: number) => string,
+): Promise<{
   connected: TabInfo | null;
   others?: TabInfo[];
 }> {
-  const connectedId = await getConnectedTabId();
+  const ownId = await tabIdForOwner(owner);
   let connected: TabInfo | null = null;
-  if (connectedId != null) {
-    const tab = await getTab(connectedId);
-    if (tab?.id != null) {
-      connected = toTabInfo(tab);
-    }
+  if (ownId != null) {
+    const tab = await getTab(ownId);
+    if (tab?.id != null) connected = toTabInfo(tab);
   }
   if (!includeOthers) {
     return { connected };
   }
+  const map = await owners();
   const all = await chrome.tabs.query({});
   const others = all
-    .filter((t) => t.id != null && t.id !== connectedId)
-    .map(toTabInfo);
+    .filter((t) => t.id != null && t.id !== ownId)
+    .map((t) => {
+      const o = map.get(t.id!);
+      return {
+        ...toTabInfo(t),
+        ...(o ? { connectedBy: labelFor(o.port) } : {}),
+      };
+    });
   return { connected, others };
 }
 
@@ -176,6 +252,92 @@ function toTabInfo(tab: chrome.tabs.Tab): TabInfo {
     active: !!tab.active,
     windowId: tab.windowId,
   };
+}
+
+/**
+ * Detects whether an action (e.g. a click) starts a top-frame navigation and
+ * waits for it to finish. Start watching *before* the action.
+ */
+export function watchNavigation(tabId: number): {
+  settle: (opts?: {
+    graceMs?: number;
+    timeoutMs?: number;
+  }) => Promise<{ navigated: boolean; sameDocument?: boolean; timedOut?: boolean }>;
+  dispose: () => void;
+} {
+  let started = false;
+  let sameDocument = false;
+  let completed = false;
+  let wake: (() => void) | null = null;
+  const poke = () => wake?.();
+
+  const onBefore = (d: { tabId: number; frameId: number }) => {
+    if (d.tabId !== tabId || d.frameId !== 0) return;
+    started = true;
+    completed = false;
+    poke();
+  };
+  const onDone = (d: { tabId: number; frameId: number }) => {
+    if (d.tabId !== tabId || d.frameId !== 0) return;
+    if (started) completed = true;
+    poke();
+  };
+  const onSameDoc = (d: { tabId: number; frameId: number }) => {
+    if (d.tabId !== tabId || d.frameId !== 0) return;
+    if (!started) {
+      started = true;
+      sameDocument = true;
+      completed = true;
+    }
+    poke();
+  };
+
+  chrome.webNavigation.onBeforeNavigate.addListener(onBefore);
+  chrome.webNavigation.onCompleted.addListener(onDone);
+  chrome.webNavigation.onErrorOccurred.addListener(onDone);
+  chrome.webNavigation.onHistoryStateUpdated.addListener(onSameDoc);
+  chrome.webNavigation.onReferenceFragmentUpdated.addListener(onSameDoc);
+
+  const dispose = () => {
+    chrome.webNavigation.onBeforeNavigate.removeListener(onBefore);
+    chrome.webNavigation.onCompleted.removeListener(onDone);
+    chrome.webNavigation.onErrorOccurred.removeListener(onDone);
+    chrome.webNavigation.onHistoryStateUpdated.removeListener(onSameDoc);
+    chrome.webNavigation.onReferenceFragmentUpdated.removeListener(onSameDoc);
+  };
+
+  const waitUntil = (cond: () => boolean, ms: number) =>
+    new Promise<boolean>((resolve) => {
+      if (cond()) return resolve(true);
+      const t = setTimeout(() => {
+        wake = null;
+        resolve(cond());
+      }, ms);
+      wake = () => {
+        if (cond()) {
+          clearTimeout(t);
+          wake = null;
+          resolve(true);
+        }
+      };
+    });
+
+  const settle = async (opts: { graceMs?: number; timeoutMs?: number } = {}) => {
+    try {
+      const began = await waitUntil(() => started, opts.graceMs ?? 400);
+      if (!began) return { navigated: false };
+      const done = await waitUntil(() => completed, opts.timeoutMs ?? 30_000);
+      return {
+        navigated: true,
+        ...(sameDocument ? { sameDocument: true } : {}),
+        ...(done ? {} : { timedOut: true }),
+      };
+    } finally {
+      dispose();
+    }
+  };
+
+  return { settle, dispose };
 }
 
 export async function waitForLoad(

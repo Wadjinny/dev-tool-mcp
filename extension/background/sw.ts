@@ -1,5 +1,6 @@
 import {
   DEFAULT_WS_PORT,
+  ERROR_MESSAGES,
   ErrorCodes,
   PICK_ELEMENT_TIMEOUT_MS,
   bridgeError,
@@ -12,7 +13,7 @@ import {
   attachDebugger,
   clearConsole,
   detachDebugger,
-  getAttachedTabId,
+  forgetTab,
   getNetworkEntry,
   getResponseBody,
   handleDebuggerDetach,
@@ -28,17 +29,18 @@ import {
 } from "./debugger.js";
 import {
   anyExtensionConnected,
-  controlStatus,
-  emitEvent,
-  ensureControl,
+  askUserConsent,
+  connectedPorts,
+  emitEventToPort,
   getControllerPort,
   getTokenForPort,
+  identityOfPort,
   initHubListeners,
+  labelForPort,
+  onIdentitiesChanged,
   pendingControlLabel,
   reconnectAll,
   refreshBridges,
-  releaseControl,
-  requestControl,
   respond,
   setHubHooks,
   setLastError,
@@ -57,41 +59,163 @@ import {
   isActivePick,
   listPins,
   pinCount,
-  resetPinsForTabChange,
+  resetPinsForTab,
   type PickPayload,
 } from "./pins.js";
 import {
+  assertConnectable,
   buildState,
-  connectTab,
-  disconnectTab,
-  getConnectedTabId,
+  getTab,
+  getTabOwner,
   isRestrictedUrl,
+  listOwnedTabs,
   listTabs,
-  requireConnectedTab,
-  setConnectedTabId,
-  updateBadge,
+  onTabOwnerChanged,
+  releaseTabsOfPort,
+  requireTabFor,
+  sameOwner,
+  setTabOwner,
+  tabIdForOwner,
   waitForLoad,
+  watchNavigation,
+  type TabOwner,
 } from "./tabs.js";
+import {
+  markActivity,
+  refreshIndicator,
+  relabelAll,
+  setIndicatorLabelProvider,
+  setTabIndicator,
+  withOverlayHidden,
+} from "./indicator.js";
+
+/** RPCs that don't act on the page, so they shouldn't pulse the indicator. */
+const QUIET_METHODS = new Set([
+  "ping",
+  "state.get",
+  "tabs.list",
+  "control.status",
+]);
+
+/** How long a vanished bridge keeps its tab (MCP restart, SW wake-up). */
+const RELEASE_GRACE_MS = 60_000;
+/** Port -> when we first saw it owning a tab without an open socket. */
+const missingSince = new Map<number, number>();
+
+/**
+ * Release tabs whose session has been gone for RELEASE_GRACE_MS. Runs on the
+ * 30 s keepalive alarm (timers alone die when Chrome suspends the worker) and
+ * shortly after a socket closes.
+ */
+async function sweepOrphanTabs(): Promise<void> {
+  const live = new Set(connectedPorts());
+  const now = Date.now();
+  const ports = new Set((await listOwnedTabs()).map(([, o]) => o.port));
+  for (const port of ports) {
+    if (live.has(port)) {
+      missingSince.delete(port);
+      continue;
+    }
+    const since = missingSince.get(port) ?? now;
+    missingSince.set(port, since);
+    if (now - since >= RELEASE_GRACE_MS) {
+      missingSince.delete(port);
+      await releaseTabsOfPort(port);
+    }
+  }
+}
+
+setIndicatorLabelProvider((port) => labelForPort(port));
+onIdentitiesChanged(() => {
+  void (async () => {
+    // A port may now belong to a different process: drop its old tabs first.
+    for (const port of connectedPorts()) await dropStaleOwnership(port);
+    await relabelAll();
+  })();
+});
+
+onTabOwnerChanged(async (tabId, prev, next) => {
+  if (prev && !sameOwner(prev, next)) {
+    // Leaving a session: drop its tab-scoped capture, pins and picker.
+    await clearPinsAndLocal(tabId);
+    await forgetTab(tabId);
+  }
+  await setTabIndicator(tabId, next?.port ?? null);
+  if (prev) void pushStateTo(prev.port);
+  if (next && next.port !== prev?.port) void pushStateTo(next.port);
+});
 
 setHubHooks({
   onRequest: (msg, ws, port) => handleRequest(msg, ws, port),
-  onConnected: () => pushState(),
+  onConnected: async (port) => {
+    missingSince.delete(port);
+    await dropStaleOwnership(port);
+    await pushStateTo(port);
+  },
+  onDisconnected: (port) => {
+    if (!missingSince.has(port)) missingSince.set(port, Date.now());
+    setTimeout(() => void sweepOrphanTabs(), RELEASE_GRACE_MS + 1_000);
+  },
 });
-setDebuggerEventEmitter(emitEvent);
+
+// CDP events go only to the session that owns the tab.
+setDebuggerEventEmitter((event, payload, tabId) => {
+  void (async () => {
+    const owner = await getTabOwner(tabId);
+    if (owner) emitEventToPort(owner.port, event, payload);
+  })();
+});
 initHubListeners();
 
-async function currentState(): Promise<BridgeState> {
-  const base = await buildState(anyExtensionConnected());
-  const tabId = await getConnectedTabId();
+function ownerOf(port: number): TabOwner {
+  return { port, startedAt: identityOfPort(port)?.startedAt ?? null };
+}
+
+/** A new MCP process reusing a port must not inherit the old process's tab. */
+async function dropStaleOwnership(port: number): Promise<void> {
+  const me = ownerOf(port);
+  if (me.startedAt == null) return;
+  for (const [tabId, o] of await listOwnedTabs()) {
+    if (o.port === port && o.startedAt != null && o.startedAt !== me.startedAt) {
+      await setTabOwner(tabId, null);
+    }
+  }
+}
+
+async function stateFor(port: number): Promise<BridgeState> {
+  const tabId = await tabIdForOwner(ownerOf(port));
+  const base = await buildState(anyExtensionConnected(), tabId);
   return {
     ...base,
-    debuggerAttached:
-      tabId != null ? isDebuggerAttached(tabId) : isDebuggerAttached(),
+    debuggerAttached: tabId != null && isDebuggerAttached(tabId),
   };
 }
 
-async function pushState(): Promise<void> {
-  emitEvent("state.changed", await currentState());
+async function pushStateTo(port: number): Promise<void> {
+  emitEventToPort(port, "state.changed", await stateFor(port));
+}
+
+async function pushStateForTab(tabId: number): Promise<void> {
+  const owner = await getTabOwner(tabId);
+  if (owner) await pushStateTo(owner.port);
+}
+
+/** What browser_control_status returns now that each session owns a tab. */
+async function sessionStatus(port: number): Promise<unknown> {
+  const tabId = await tabIdForOwner(ownerOf(port));
+  const tab = tabId != null ? await getTab(tabId) : null;
+  const others = (await listOwnedTabs())
+    .filter(([, o]) => o.port !== port)
+    .map(([id, o]) => ({ tabId: id, session: labelForPort(o.port) }));
+  return {
+    self: identityOfPort(port),
+    label: labelForPort(port),
+    connectedTab: tab
+      ? { id: tab.id, url: tab.url, title: tab.title, active: tab.active }
+      : null,
+    otherSessions: others,
+    note: "Each MCP session owns its own Connected tab, so no control lease is needed. Use browser_connect_tab to take over an existing tab (the user is asked to Allow).",
+  };
 }
 
 type PageFrame = {
@@ -214,10 +338,11 @@ async function ensureContentScript(tabId: number): Promise<void> {
 }
 
 function withPinTarget(
+  tabId: number,
   params: Record<string, unknown>,
 ): Record<string, unknown> {
   if (typeof params.pin === "string") {
-    const pin = getPin(params.pin);
+    const pin = getPin(tabId, params.pin);
     if (!pin) {
       throw bridgeError(
         ErrorCodes.INVALID_PIN,
@@ -274,11 +399,12 @@ function formatEvaluateError(message: string, world: string): string {
 }
 
 function withDragTargets(
+  tabId: number,
   params: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...params };
   if (typeof params.startPin === "string") {
-    const pin = getPin(params.startPin);
+    const pin = getPin(tabId, params.startPin);
     if (!pin) {
       throw bridgeError(
         ErrorCodes.INVALID_PIN,
@@ -288,7 +414,7 @@ function withDragTargets(
     out.startSelector = pin.selector;
   }
   if (typeof params.endPin === "string") {
-    const pin = getPin(params.endPin);
+    const pin = getPin(tabId, params.endPin);
     if (!pin) {
       throw bridgeError(
         ErrorCodes.INVALID_PIN,
@@ -303,16 +429,15 @@ function withDragTargets(
 async function syncPinsToTab(tabId: number): Promise<void> {
   try {
     await pageAction(tabId, "pins.sync", {
-      pins: listPins(),
+      pins: listPins(tabId),
     });
   } catch {
     // content may be gone
   }
 }
 
-async function clearPinsAndLocal(tabId: number | null): Promise<void> {
-  resetPinsForTabChange();
-  if (tabId == null) return;
+async function clearPinsAndLocal(tabId: number): Promise<void> {
+  resetPinsForTab(tabId);
   try {
     await pageAction(tabId, "pins.clearLocal", {});
   } catch {
@@ -324,7 +449,7 @@ async function startPickerOnTab(
   tabId: number,
   opts: { prompt?: string; wait: boolean; timeoutMs?: number },
 ): Promise<unknown> {
-  const pinId = allocatePinId();
+  const pinId = allocatePinId(tabId);
   const timeoutMs = opts.timeoutMs ?? PICK_ELEMENT_TIMEOUT_MS;
   const waitPromise = beginPickSession({
     tabId,
@@ -338,19 +463,19 @@ async function startPickerOnTab(
       prompt: opts.prompt,
     });
   } catch (err) {
-    cancelPick("PICK_CANCELLED");
+    cancelPick(tabId, "PICK_CANCELLED");
     throw err;
   }
   if (!opts.wait) {
     setTimeout(() => {
       void (async () => {
-        if (!isActivePick(pinId)) return;
+        if (!isActivePick(tabId, pinId)) return;
         try {
           await pageAction(tabId, "pickerCancel", {});
         } catch {
           // ignore
         }
-        if (isActivePick(pinId)) cancelPick("PICK_CANCELLED");
+        if (isActivePick(tabId, pinId)) cancelPick(tabId, "PICK_CANCELLED");
       })();
     }, timeoutMs);
     return { ok: true, pinId, active: true };
@@ -681,22 +806,30 @@ async function handleRequest(
   }
 
   try {
-    if (msg.method === "control.request") {
-      respond(ws, msg.id, true, await requestControl(port));
+    if (msg.method === "control.request" || msg.method === "control.status") {
+      respond(ws, msg.id, true, await sessionStatus(port));
       return;
     }
     if (msg.method === "control.release") {
-      respond(ws, msg.id, true, await releaseControl(port));
-      return;
-    }
-    if (msg.method === "control.status") {
-      respond(ws, msg.id, true, await controlStatus(port));
+      const own = await tabIdForOwner(ownerOf(port));
+      if (own != null) await setTabOwner(own, null);
+      respond(ws, msg.id, true, await sessionStatus(port));
       return;
     }
 
-    await ensureControl(port, msg.method);
-    const result = await route(msg.method, msg.params ?? {});
-    respond(ws, msg.id, true, result);
+    const quiet = QUIET_METHODS.has(msg.method);
+    const pulse = async () => {
+      if (quiet) return;
+      const own = await tabIdForOwner(ownerOf(port));
+      if (own != null) markActivity(own);
+    };
+    await pulse();
+    try {
+      const result = await route(msg.method, msg.params ?? {}, port);
+      respond(ws, msg.id, true, result);
+    } finally {
+      await pulse();
+    }
   } catch (err) {
     const e = err as BridgeError;
     const error: BridgeError =
@@ -711,37 +844,75 @@ async function handleRequest(
   }
 }
 
-async function switchConnectedTab(tabId: number): Promise<BridgeState> {
-  const prev = await getConnectedTabId();
-  if (prev != null && prev !== tabId) {
-    await clearPinsAndLocal(prev);
-    if (isDebuggerAttached(prev)) {
-      await detachDebugger();
-    }
-  }
-  const state = await connectTab(tabId);
+/** Give a tab to a session (user already consented or the agent created it). */
+async function assignTab(port: number, tabId: number): Promise<void> {
+  await setTabOwner(tabId, ownerOf(port));
   try {
     await ensureContentScript(tabId);
   } catch {
     // injection may fail until page settles; Connect still succeeds
   }
-  const full = {
-    ...state,
-    debuggerAttached: isDebuggerAttached(tabId),
-  };
-  emitEvent("state.changed", full);
-  return full;
 }
 
+/** browser_connect_tab: take over an existing tab, always with the user's Allow. */
+async function connectExistingTab(
+  port: number,
+  tabId: number,
+): Promise<unknown> {
+  const tab = await assertConnectable(tabId);
+  const me = ownerOf(port);
+  const current = await getTabOwner(tabId);
+  if (!sameOwner(current, me)) {
+    let origin = tab.url ?? "";
+    try {
+      origin = new URL(tab.url ?? "").host;
+    } catch {
+      // keep raw
+    }
+    const answer = await askUserConsent(
+      "dev-tool-mcp: connect a tab",
+      `${labelForPort(port)} wants to control "${tab.title ?? "tab"}" (${origin}).` +
+        (current ? `\nCurrently controlled by ${labelForPort(current.port)}.` : ""),
+    );
+    if (answer === "timeout") {
+      throw bridgeError(
+        ErrorCodes.CONTROL_REQUEST_TIMEOUT,
+        "No answer to the Allow/Deny notification within 60s (the user may not have seen it). Ask the user, then call browser_connect_tab again.",
+      );
+    }
+    if (answer === "denied") {
+      throw bridgeError(
+        ErrorCodes.CONTROL_DENIED,
+        "The user denied this session control of that tab.",
+      );
+    }
+    await assignTab(port, tabId);
+  }
+  const updated = await getTab(tabId);
+  return {
+    tabId,
+    url: updated?.url,
+    title: updated?.title,
+    connected: true,
+  };
+}
+
+/**
+ * Open a URL in a new tab owned by this session. With recordNetwork the
+ * debugger is attached *before* navigating, so the page's own load is captured.
+ */
 async function openAndConnectTab(
+  port: number,
   url: string,
   active: boolean,
+  recordNetwork: boolean,
 ): Promise<{
   url: string | undefined;
   title: string | undefined;
   tabId: number;
   opened: boolean;
   connectedTabId: number | null;
+  recordingNetwork: boolean;
 }> {
   if (isRestrictedUrl(url)) {
     throw bridgeError(
@@ -749,104 +920,155 @@ async function openAndConnectTab(
       "Cannot open a restricted URL.",
     );
   }
-  const created = await chrome.tabs.create({ url, active });
+  const created = await chrome.tabs.create({
+    url: recordNetwork ? "about:blank" : url,
+    active,
+  });
   if (created.id == null) {
     throw bridgeError(ErrorCodes.TAB_GONE, "Failed to create tab.");
   }
-  await waitForLoad(created.id, "complete");
-  const updated = await chrome.tabs.get(created.id);
+  const tabId = created.id;
+  if (recordNetwork) {
+    await setTabOwner(tabId, ownerOf(port));
+    await attachDebugger(tabId);
+    await chrome.tabs.update(tabId, { url });
+  }
+  await waitForLoad(tabId, "complete");
+  const updated = await chrome.tabs.get(tabId);
   if (isRestrictedUrl(updated.url)) {
-    await chrome.tabs.remove(created.id).catch(() => undefined);
+    await setTabOwner(tabId, null);
+    await chrome.tabs.remove(tabId).catch(() => undefined);
     throw bridgeError(
       ErrorCodes.RESTRICTED_URL,
       "Opened tab landed on a restricted URL.",
     );
   }
-  const state = await switchConnectedTab(created.id);
+  await assignTab(port, tabId);
   return {
     url: updated.url,
     title: updated.title,
-    tabId: created.id,
+    tabId,
     opened: true,
-    connectedTabId: state.connectedTabId,
+    connectedTabId: tabId,
+    recordingNetwork: isDebuggerAttached(tabId),
+  };
+}
+
+/**
+ * Run a page action that may trigger a navigation (click, Enter, submit) and,
+ * unless disabled, wait for that navigation to finish before returning.
+ */
+async function withNavigationWait(
+  tabId: number,
+  enabled: boolean,
+  action: () => Promise<unknown>,
+): Promise<unknown> {
+  if (!enabled) return action();
+  const nav = watchNavigation(tabId);
+  let result: unknown;
+  try {
+    result = await action();
+  } catch (err) {
+    nav.dispose();
+    throw err;
+  }
+  const settled = await nav.settle({ graceMs: 400, timeoutMs: 30_000 });
+  if (!settled.navigated) return result;
+  const tab = await getTab(tabId);
+  const base =
+    result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+  return {
+    ...base,
+    navigated: true,
+    url: tab?.url,
+    title: tab?.title,
+    ...(settled.sameDocument ? { sameDocument: true } : {}),
+    ...(settled.timedOut
+      ? { note: "Navigation started but did not finish within 30s." }
+      : {}),
   };
 }
 
 async function route(
   method: string,
   params: Record<string, unknown>,
+  port: number,
 ): Promise<unknown> {
+  const me = ownerOf(port);
   switch (method) {
     case "ping":
       return { ok: true, t: Date.now() };
 
     case "state.get":
-      return currentState();
+      return stateFor(port);
 
-    case "tabs.connect": {
-      const tabId = Number(params.tabId);
-      return switchConnectedTab(tabId);
-    }
+    case "tabs.connect":
+      return connectExistingTab(port, Number(params.tabId));
 
     case "tabs.disconnect": {
-      const prev = await getConnectedTabId();
-      if (isDebuggerAttached()) await detachDebugger();
-      await clearPinsAndLocal(prev);
-      const state = await disconnectTab();
-      emitEvent("state.changed", state);
-      return state;
+      const own = await tabIdForOwner(me);
+      if (own != null) await setTabOwner(own, null);
+      return stateFor(port);
     }
 
     case "tabs.list":
-      return listTabs(!!params.includeOthers);
+      return listTabs(me, !!params.includeOthers, labelForPort);
 
     case "tabs.open": {
       const url = String(params.url);
-      return openAndConnectTab(url, params.active !== false);
+      return openAndConnectTab(
+        port,
+        url,
+        params.active !== false,
+        params.recordNetwork === true,
+      );
     }
 
     case "tabs.navigate": {
       const url = String(params.url);
-      const existingId = await getConnectedTabId();
+      const recordNetwork = params.recordNetwork === true;
+      const existingId = await tabIdForOwner(me);
       if (existingId == null) {
-        return openAndConnectTab(url, true);
+        return openAndConnectTab(port, url, true, recordNetwork);
       }
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       if (isRestrictedUrl(url)) {
         throw bridgeError(ErrorCodes.RESTRICTED_URL, "Cannot navigate to restricted URL.");
       }
+      if (recordNetwork) await attachDebugger(tab.id!);
       await chrome.tabs.update(tab.id!, { url });
       await waitForLoad(tab.id!, "complete");
       const updated = await chrome.tabs.get(tab.id!);
-      await pushState();
+      await pushStateTo(port);
       return {
         url: updated.url,
         title: updated.title,
         tabId: updated.id,
         opened: false,
+        recordingNetwork: isDebuggerAttached(tab.id!),
       };
     }
 
     case "tabs.goBack": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       await chrome.tabs.goBack(tab.id!);
       await waitForLoad(tab.id!, "complete");
       const updated = await chrome.tabs.get(tab.id!);
-      await pushState();
+      await pushStateTo(port);
       return { url: updated.url, title: updated.title };
     }
 
     case "tabs.goForward": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       await chrome.tabs.goForward(tab.id!);
       await waitForLoad(tab.id!, "complete");
       const updated = await chrome.tabs.get(tab.id!);
-      await pushState();
+      await pushStateTo(port);
       return { url: updated.url, title: updated.title };
     }
 
     case "tabs.wait": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const time = typeof params.time === "number" ? params.time : 0;
       const load = params.load as "complete" | "domcontentloaded" | undefined;
       if (time > 0) await new Promise((r) => setTimeout(r, time));
@@ -855,43 +1077,49 @@ async function route(
     }
 
     case "page.snapshot": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       return snapshotAllFrames(tab.id!, params.interestingOnly !== false);
     }
 
     case "page.find": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const query = String(params.query ?? "");
       const limit = typeof params.limit === "number" ? params.limit : 20;
       return findAllFrames(tab.id!, query, limit);
     }
 
     case "page.click": {
-      const tab = await requireConnectedTab();
-      const routed = withFrameLocalRefs(withPinTarget(params));
-      return pageAction(tab.id!, "click", routed.params, routed.frameId);
+      const tab = await requireTabFor(me);
+      const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
+      return withNavigationWait(tab.id!, params.waitForNavigation !== false, () =>
+        pageAction(tab.id!, "click", routed.params, routed.frameId),
+      );
     }
 
     case "page.hover": {
-      const tab = await requireConnectedTab();
-      const routed = withFrameLocalRefs(withPinTarget(params));
+      const tab = await requireTabFor(me);
+      const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
       return pageAction(tab.id!, "hover", routed.params, routed.frameId);
     }
 
     case "page.drag": {
-      const tab = await requireConnectedTab();
-      const routed = withFrameLocalRefs(withDragTargets(params));
+      const tab = await requireTabFor(me);
+      const routed = withFrameLocalRefs(withDragTargets(tab.id!, params));
       return pageAction(tab.id!, "drag", routed.params, routed.frameId);
     }
 
     case "page.type": {
-      const tab = await requireConnectedTab();
-      const routed = withFrameLocalRefs(withPinTarget(params));
-      return pageAction(tab.id!, "type", routed.params, routed.frameId);
+      const tab = await requireTabFor(me);
+      const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
+      return withNavigationWait(
+        tab.id!,
+        params.submit === true && params.waitForNavigation !== false,
+        () => pageAction(tab.id!, "type", routed.params, routed.frameId),
+      );
     }
 
     case "page.pickElement": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const prompt =
         typeof params.prompt === "string" ? params.prompt : undefined;
       const timeoutMs =
@@ -906,37 +1134,37 @@ async function route(
     }
 
     case "page.pickCancel": {
-      const tabId = await getConnectedTabId();
+      const tabId = await tabIdForOwner(me);
       if (tabId != null) {
         try {
           await pageAction(tabId, "pickerCancel", {});
         } catch {
           // ignore
         }
+        cancelPick(tabId, "PICK_CANCELLED");
       }
-      cancelPick("PICK_CANCELLED");
       return { ok: true };
     }
 
     case "pins.list": {
-      await requireConnectedTab();
-      return { pins: listPins() };
+      const tab = await requireTabFor(me);
+      return { pins: listPins(tab.id!) };
     }
 
     case "pins.inspect": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const pinId = String(params.pin ?? params.id ?? "");
       if (!pinId) {
         throw bridgeError(ErrorCodes.INVALID_PIN, "pin is required");
       }
-      const pin = getPin(pinId);
+      const pin = getPin(tab.id!, pinId);
       if (!pin) {
         throw bridgeError(ErrorCodes.INVALID_PIN, `Unknown pin: ${pinId}`);
       }
       const inspected = (await pageAction(
         tab.id!,
         "pins.inspect",
-        withPinTarget({ pin: pinId }),
+        withPinTarget(tab.id!, { pin: pinId }),
       )) as Record<string, unknown>;
       return {
         pin,
@@ -948,9 +1176,9 @@ async function route(
     }
 
     case "pins.clear": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const id = typeof params.id === "string" ? params.id : undefined;
-      const result = clearPins(id);
+      const result = clearPins(tab.id!, id);
       try {
         await pageAction(tab.id!, "pins.clearLocal", id ? { id } : {});
       } catch {
@@ -961,39 +1189,61 @@ async function route(
     }
 
     case "page.pressKey": {
-      const tab = await requireConnectedTab();
-      return pageAction(tab.id!, "pressKey", params);
+      const tab = await requireTabFor(me);
+      return withNavigationWait(tab.id!, params.waitForNavigation !== false, () =>
+        pageAction(tab.id!, "pressKey", params),
+      );
     }
 
     case "page.screenshot": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
+      const tabId = tab.id!;
       const fullPage = !!params.fullPage;
-      if (fullPage) {
-        try {
-          await attachDebugger(tab.id!);
-          const result = (await sendCommand(tab.id!, "Page.captureScreenshot", {
-            format: "png",
-            captureBeyondViewport: true,
-            fromSurface: true,
-          })) as { data: string };
-          return { mimeType: "image/png", base64: result.data };
-        } catch {
-          // fall through to visible
+      return withOverlayHidden(tabId, async () => {
+        // captureVisibleTab grabs whatever tab is in front of the window, so it
+        // must only be used when that is the Connected tab. Otherwise use CDP.
+        const [front] = await chrome.tabs.query({
+          active: true,
+          windowId: tab.windowId,
+        });
+        const isFront = front?.id === tabId;
+        if (!isFront) {
+          // CDP capture of a background tab hangs until timeout; fail fast.
+          throw bridgeError(
+            ErrorCodes.TAB_NOT_VISIBLE,
+            ERROR_MESSAGES.TAB_NOT_VISIBLE,
+          );
         }
-      }
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-        format: "png",
+        if (fullPage) {
+          try {
+            await attachDebugger(tabId);
+            const result = (await withTimeout(
+              sendCommand(tabId, "Page.captureScreenshot", {
+                format: "png",
+                captureBeyondViewport: true,
+                fromSurface: true,
+              }),
+              8_000,
+            )) as { data: string };
+            return { mimeType: "image/png", base64: result.data };
+          } catch {
+            // fall through to visible capture
+          }
+        }
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: "png",
+        });
+        const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+        return { mimeType: "image/png", base64 };
       });
-      const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-      return { mimeType: "image/png", base64 };
     }
 
     case "page.evaluate": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const expression = String(params.expression);
       const world = (params.world as string) || "isolated";
       const awaitPromise = params.awaitPromise !== false;
-      const pinParams = withPinTarget(params);
+      const pinParams = withPinTarget(tab.id!, params);
       const hasPinTarget = typeof pinParams.pin === "string";
       let chromeFrameId = 0;
       if (params.frame !== undefined && params.frame !== null) {
@@ -1129,53 +1379,56 @@ async function route(
     }
 
     case "debugger.attach": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const r = await attachDebugger(tab.id!);
-      await pushState();
+      await pushStateTo(port);
       return r;
     }
 
     case "debugger.detach": {
-      const r = await detachDebugger();
-      await pushState();
+      const tabId = await tabIdForOwner(me);
+      const r =
+        tabId != null ? await detachDebugger(tabId) : { attached: false };
+      await pushStateTo(port);
       return r;
     }
 
     case "debugger.targets": {
-      await requireConnectedTab();
-      if (!isDebuggerAttached()) {
-        const tab = await requireConnectedTab();
-        await attachDebugger(tab.id!);
-      }
-      return listDebuggerTargets();
+      const tab = await requireTabFor(me);
+      if (!isDebuggerAttached(tab.id!)) await attachDebugger(tab.id!);
+      return listDebuggerTargets(tab.id!);
     }
 
     case "debugger.sendCommand": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const methodName = String(params.method);
       const cdpParams = (params.params as Record<string, unknown>) ?? {};
       return sendCommand(tab.id!, methodName, cdpParams);
     }
 
-    case "console.list":
-      return listConsole(!!params.clear);
+    case "console.list": {
+      const tab = await requireTabFor(me);
+      return listConsole(tab.id!, !!params.clear);
+    }
 
-    case "console.clear":
-      return clearConsole();
+    case "console.clear": {
+      const tab = await requireTabFor(me);
+      return clearConsole(tab.id!);
+    }
 
     case "network.list": {
-      await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const filter = networkFilterFromParams(params);
       if (filter.waitForMs != null && filter.waitForMs > 0) {
         const { waitForMs, ...rest } = filter;
-        return waitForNetwork(rest, waitForMs);
+        return waitForNetwork(tab.id!, rest, waitForMs);
       }
-      return listNetwork(filter);
+      return listNetwork(tab.id!, filter);
     }
 
     case "network.summary": {
-      await requireConnectedTab();
-      return listNetworkSummary({
+      const tab = await requireTabFor(me);
+      return listNetworkSummary(tab.id!, {
         since:
           typeof params.since === "number" ? params.since : undefined,
         limitHosts:
@@ -1190,30 +1443,33 @@ async function route(
     }
 
     case "network.get": {
-      await requireConnectedTab();
-      return getNetworkEntry(String(params.requestId ?? params.id ?? ""));
+      const tab = await requireTabFor(me);
+      return getNetworkEntry(
+        tab.id!,
+        String(params.requestId ?? params.id ?? ""),
+      );
     }
 
     case "network.getResponseBody": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       return getResponseBody(tab.id!, String(params.requestId));
     }
 
     case "network.forPin": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       await attachDebugger(tab.id!);
       const pinId = String(params.pin ?? "");
       if (!pinId) {
         throw bridgeError(ErrorCodes.INVALID_PIN, "pin is required");
       }
-      const pin = getPin(pinId);
+      const pin = getPin(tab.id!, pinId);
       if (!pin) {
         throw bridgeError(ErrorCodes.INVALID_PIN, `Unknown pin: ${pinId}`);
       }
       const inspected = (await pageAction(
         tab.id!,
         "pins.inspect",
-        withPinTarget({ pin: pinId }),
+        withPinTarget(tab.id!, { pin: pinId }),
       )) as { relatedUrls?: string[]; src?: string | null; currentSrc?: string | null; href?: string | null };
       const relatedUrls = [
         ...new Set(
@@ -1225,7 +1481,7 @@ async function route(
           ].filter((u): u is string => typeof u === "string" && !!u),
         ),
       ];
-      const listed = listNetwork({
+      const listed = listNetwork(tab.id!, {
         limit: typeof params.limit === "number" ? params.limit : 100,
         includeWebSocketMessages: !!params.includeWebSocketMessages,
       });
@@ -1253,14 +1509,14 @@ async function route(
     }
 
     case "storage.getCookies": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const url = tab.url!;
       const cookies = await chrome.cookies.getAll({ url });
       return { cookies };
     }
 
     case "storage.setCookie": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const cookie = params.cookie as chrome.cookies.SetDetails;
       await chrome.cookies.set({
         url: cookie.url || tab.url!,
@@ -1277,7 +1533,7 @@ async function route(
     }
 
     case "storage.clearCookies": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const cookies = await chrome.cookies.getAll({ url: tab.url! });
       for (const c of cookies) {
         const protocol = c.secure ? "https:" : "http:";
@@ -1296,7 +1552,7 @@ async function route(
     case "storage.setSession":
     case "storage.clearLocal":
     case "storage.clearSession": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       const store = method.includes("Local") ? "localStorage" : "sessionStorage";
       const action = method.includes("get")
         ? "get"
@@ -1336,9 +1592,9 @@ async function route(
     }
 
     case "dom.getBoxModel": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       if (typeof params.ref === "string" || typeof params.pin === "string") {
-        const routed = withFrameLocalRefs(withPinTarget(params));
+        const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
         return pageAction(
           tab.id!,
           "elementBox",
@@ -1362,11 +1618,11 @@ async function route(
     }
 
     case "dom.getComputedStyle": {
-      const tab = await requireConnectedTab();
+      const tab = await requireTabFor(me);
       await attachDebugger(tab.id!);
       let selector = typeof params.selector === "string" ? params.selector : "";
       if (typeof params.ref === "string" || typeof params.pin === "string") {
-        const routed = withFrameLocalRefs(withPinTarget(params));
+        const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
         const box = (await pageAction(
           tab.id!,
           "elementBox",
@@ -1427,106 +1683,132 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source) => {
   handleDebuggerDetach(source);
-  void pushState();
+  if (source.tabId != null) void pushStateForTab(source.tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void (async () => {
-    const connected = await getConnectedTabId();
-    if (connected === tabId) {
-      if (getAttachedTabId() === tabId) await detachDebugger();
-      await clearPinsAndLocal(tabId);
-      await setConnectedTabId(null);
-      await updateBadge(false);
-      await pushState();
-    }
+    if (await getTabOwner(tabId)) await setTabOwner(tabId, null);
+    await forgetTab(tabId);
   })();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   void (async () => {
-    const connected = await getConnectedTabId();
-    if (connected !== tabId) return;
-    if (info.url && isRestrictedUrl(info.url)) {
-      if (isDebuggerAttached(tabId)) await detachDebugger();
-      await clearPinsAndLocal(tabId);
-      await setConnectedTabId(null);
-      await updateBadge(false);
+    if (!(await getTabOwner(tabId))) return;
+    // about:blank is the transient start page of browser_open(recordNetwork).
+    if (info.url && info.url !== "about:blank" && isRestrictedUrl(info.url)) {
+      await setTabOwner(tabId, null);
       await setLastError("Auto-disconnected: restricted URL.");
-      await pushState();
       return;
     }
     if (info.status === "complete" || info.title || info.url) {
-      await pushState();
+      await pushStateForTab(tabId);
     }
   })();
+});
+
+chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
+  if (details.frameId !== 0) return;
+  void refreshIndicator(details.tabId);
 });
 
 chrome.webNavigation.onCommitted.addListener((details) => {
   void (async () => {
     if (details.frameId !== 0) return;
-    const connected = await getConnectedTabId();
-    if (connected !== details.tabId) return;
+    if (!(await getTabOwner(details.tabId))) return;
     await clearPinsAndLocal(details.tabId);
   })();
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+async function activeTab(): Promise<chrome.tabs.Tab | undefined> {
+  const [active] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+  return active;
+}
+
+/** Session the popup's Connect button assigns tabs to. */
+async function popupTargetPort(): Promise<number> {
+  const live = connectedPorts();
+  const preferred = await getControllerPort();
+  if (preferred != null && live.includes(preferred)) return preferred;
+  if (live.length === 1) return live[0]!;
+  if (live.length === 0) {
+    throw bridgeError(
+      ErrorCodes.EXTENSION_DISCONNECTED,
+      "No MCP session is connected to the extension.",
+    );
+  }
+  throw bridgeError(
+    ErrorCodes.UNKNOWN,
+    "Several MCP sessions are connected. Click a session card to choose a Connect target first.",
+  );
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.target !== "sw") return false;
   void (async () => {
     try {
+      // Messages from content scripts (picker, pin panel, overlay Stop) carry
+      // their tab; popup messages act on the active tab.
+      const senderTabId = sender.tab?.id;
+
       if (msg.type === "picker.picked") {
+        if (senderTabId == null) throw new Error("picker message without tab");
         const payload = msg.pin as PickPayload;
         const keepSelecting = !!msg.keepSelecting;
-        const pin = completePick(payload);
-        const tabId = await getConnectedTabId();
+        const pin = completePick(senderTabId, payload);
         let nextPinId: string | undefined;
-        if (keepSelecting && pin && tabId != null) {
-          nextPinId = armNextKeepPick(tabId);
-        }
-        if (tabId != null) await syncPinsToTab(tabId);
+        if (keepSelecting && pin) nextPinId = armNextKeepPick(senderTabId);
+        await syncPinsToTab(senderTabId);
         sendResponse({ ok: true, nextPinId, pin });
         return;
       }
       if (msg.type === "picker.cancelled") {
-        cancelPick("PICK_CANCELLED");
+        if (senderTabId != null) cancelPick(senderTabId, "PICK_CANCELLED");
         sendResponse({ ok: true });
         return;
       }
       if (msg.type === "pins.remove") {
         const id = typeof msg.id === "string" ? msg.id : undefined;
-        if (!id) {
+        if (!id || senderTabId == null) {
           sendResponse({ ok: false, error: "id required" });
           return;
         }
-        const tabId = await getConnectedTabId();
-        clearPins(id);
-        if (tabId != null) {
-          try {
-            await pageAction(tabId, "pins.clearLocal", { id });
-          } catch {
-            // ignore
-          }
-          await syncPinsToTab(tabId);
+        clearPins(senderTabId, id);
+        try {
+          await pageAction(senderTabId, "pins.clearLocal", { id });
+        } catch {
+          // ignore
         }
+        await syncPinsToTab(senderTabId);
         sendResponse({ ok: true });
         return;
       }
       if (msg.type === "getPopupState") {
         const port = (await getControllerPort()) ?? Number(DEFAULT_WS_PORT);
         const storage = await chrome.storage.local.get(["lastError", "wsPort"]);
-        const [active] = await chrome.tabs.query({
-          active: true,
-          currentWindow: true,
-        });
+        const active = await activeTab();
+        const owner = active?.id != null ? await getTabOwner(active.id) : null;
+        const state = await buildState(
+          anyExtensionConnected(),
+          owner ? active!.id! : null,
+        );
         sendResponse({
           ok: true,
           bridgeStatus: summaryBridgeStatus(),
           lastError: storage.lastError ?? null,
           port: storage.wsPort ?? port,
           pendingLabel: pendingControlLabel(),
-          state: await currentState(),
-          pinCount: pinCount(),
+          state: {
+            ...state,
+            debuggerAttached: owner ? isDebuggerAttached(active!.id!) : false,
+          },
+          ownerLabel: owner ? labelForPort(owner.port) : null,
+          sessionCount: (await listOwnedTabs()).length,
+          pinCount: owner ? pinCount(active!.id!) : 0,
           activeTab: active
             ? {
                 id: active.id,
@@ -1539,54 +1821,71 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       if (msg.type === "connectActive") {
-        const [active] = await chrome.tabs.query({
-          active: true,
-          currentWindow: true,
-        });
+        const active = await activeTab();
         if (!active?.id) throw bridgeError(ErrorCodes.TAB_GONE, "No active tab.");
-        const prev = await getConnectedTabId();
-        if (prev != null && prev !== active.id) {
-          await clearPinsAndLocal(prev);
-          if (isDebuggerAttached(prev)) await detachDebugger();
-        } else if (prev != null && isDebuggerAttached(prev)) {
-          await detachDebugger();
-        }
-        const state = await connectTab(active.id);
-        try {
-          await ensureContentScript(active.id);
-        } catch {
-          // ok
-        }
-        await pushState();
-        sendResponse({ ok: true, state: await currentState() });
-        void state;
+        await assertConnectable(active.id);
+        // The user clicked Connect themselves, so no extra consent prompt.
+        await assignTab(await popupTargetPort(), active.id);
+        sendResponse({ ok: true });
         return;
       }
       if (msg.type === "disconnect") {
-        const prev = await getConnectedTabId();
-        if (isDebuggerAttached()) await detachDebugger();
-        await clearPinsAndLocal(prev);
-        await disconnectTab();
-        await pushState();
-        sendResponse({ ok: true, state: await currentState() });
+        const tabId =
+          typeof msg.tabId === "number"
+            ? msg.tabId
+            : (senderTabId ?? (await activeTab())?.id);
+        if (tabId != null && (await getTabOwner(tabId))) {
+          await setTabOwner(tabId, null);
+        }
+        sendResponse({ ok: true });
         return;
       }
       if (msg.type === "startPicker") {
-        const tab = await requireConnectedTab();
+        const active = await activeTab();
+        if (!active?.id || !(await getTabOwner(active.id))) {
+          throw bridgeError(
+            ErrorCodes.NO_CONNECTED_TAB,
+            "Connect this tab first.",
+          );
+        }
         const prompt =
           typeof msg.prompt === "string" ? msg.prompt : undefined;
-        const result = await startPickerOnTab(tab.id!, {
+        const result = await startPickerOnTab(active.id, {
           prompt,
           wait: false,
         });
         sendResponse({ ok: true, result });
         return;
       }
+      if (msg.type === "detachDebugger") {
+        const active = await activeTab();
+        if (!active?.id || !(await getTabOwner(active.id))) {
+          throw bridgeError(
+            ErrorCodes.NO_CONNECTED_TAB,
+            "Connect this tab first.",
+          );
+        }
+        await detachDebugger(active.id);
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg.type === "listBridges") {
         const bridges = await refreshBridges();
+        const owned = await listOwnedTabs();
+        const withTabs = await Promise.all(
+          bridges.map(async (b) => {
+            const entry = owned.find(([, o]) => o.port === b.port);
+            const tab = entry ? await getTab(entry[0]) : null;
+            return {
+              ...b,
+              tabTitle: tab?.title ?? null,
+              tabUrl: tab?.url ?? null,
+            };
+          }),
+        );
         sendResponse({
           ok: true,
-          bridges,
+          bridges: withTabs,
           activePort: await getControllerPort(),
           pendingLabel: pendingControlLabel(),
         });
@@ -1628,7 +1927,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
-    void startHub();
+    void startHub().then(() => sweepOrphanTabs());
   }
 });
 
@@ -1645,6 +1944,29 @@ chrome.runtime.onStartup.addListener(() => {
 void chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 void startHub();
 void (async () => {
-  const id = await getConnectedTabId();
-  await updateBadge(id != null);
+  // SW restarts lose in-memory indicator state; restore it for owned tabs.
+  await chrome.action.setBadgeText({ text: "" }).catch(() => undefined);
+  for (const [tabId, owner] of await listOwnedTabs()) {
+    if (await getTab(tabId)) await setTabIndicator(tabId, owner.port);
+    else await setTabOwner(tabId, null);
+  }
 })();
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error(`timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}

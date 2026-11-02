@@ -26,6 +26,32 @@ export const INSTANCE_NAME_MAX_LEN = 40;
 /** How long the extension waits for Allow/Deny on a control steal. */
 export const CONTROL_REQUEST_TIMEOUT_MS = 60_000;
 
+/**
+ * Chrome tab-group colours, one stable colour per bridge port.
+ * Order is the session identity: the popup, the tab group, and the badge
+ * all use this list.
+ */
+export const SESSION_COLOR_PALETTE = [
+  { name: "orange", hex: "#e8710a" },
+  { name: "cyan", hex: "#12b5cb" },
+  { name: "purple", hex: "#a142f4" },
+  { name: "pink", hex: "#e52592" },
+  { name: "green", hex: "#1e8e3e" },
+  { name: "blue", hex: "#1a73e8" },
+  { name: "yellow", hex: "#f9ab00" },
+  { name: "red", hex: "#d93025" },
+] as const;
+
+export type SessionColorName = (typeof SESSION_COLOR_PALETTE)[number]["name"];
+
+export function sessionColor(port: number): {
+  name: SessionColorName;
+  hex: string;
+} {
+  const n = SESSION_COLOR_PALETTE.length;
+  return SESSION_COLOR_PALETTE[((port % n) + n) % n]!;
+}
+
 /** Identity of one bridge instance, shown in the popup's Bridges list. */
 export type BridgeIdentity = {
   pid: number;
@@ -107,6 +133,8 @@ export type TabInfo = {
   title: string;
   active: boolean;
   windowId: number;
+  /** Set when another MCP session owns this tab ("name :port"). */
+  connectedBy?: string;
 };
 
 export type ConsoleMessage = {
@@ -311,6 +339,7 @@ export type ControlChangedPayload = {
 export type ControlStatus = {
   controllerPort: number | null;
   controlling: boolean;
+  /** Identity of the bridge holding control (not necessarily the caller). */
   identity: BridgeIdentity | null;
 };
 

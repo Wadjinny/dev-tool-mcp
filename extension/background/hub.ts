@@ -66,7 +66,9 @@ type HubHooks = {
     ws: WebSocket,
     port: number,
   ) => Promise<void>;
-  onConnected: () => Promise<void>;
+  onConnected: (port: number) => Promise<void>;
+  /** Socket to a bridge closed (it may come back after a restart / SW wake). */
+  onDisconnected?: (port: number) => void;
 };
 
 const connections = new Map<number, BridgeConn>();
@@ -81,14 +83,87 @@ export function setHubHooks(next: HubHooks): void {
   hooks = next;
 }
 
+type ConsentWaiter = {
+  resolve: (answer: ConsentAnswer) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+const CONSENT_PREFIX = "dev-tool-mcp-consent-";
+const consentWaiters = new Map<string, ConsentWaiter>();
+let consentSeq = 0;
+
+/** "timeout" = no answer in time, so the agent knows asking again may help. */
+export type ConsentAnswer = "allowed" | "denied" | "timeout";
+
+function settleConsent(id: string, answer: ConsentAnswer): void {
+  const w = consentWaiters.get(id);
+  if (!w) return;
+  consentWaiters.delete(id);
+  clearTimeout(w.timer);
+  void chrome.notifications.clear(id);
+  w.resolve(answer);
+}
+
+/**
+ * Ask the user to Allow / Deny something via a Chrome notification.
+ * Resolves "denied" on Deny or dismiss, "timeout" if nobody answers in time.
+ */
+export async function askUserConsent(
+  title: string,
+  message: string,
+  timeoutMs = CONTROL_REQUEST_TIMEOUT_MS,
+): Promise<ConsentAnswer> {
+  const id = `${CONSENT_PREFIX}${++consentSeq}-${Date.now()}`;
+  try {
+    await chrome.notifications.create(id, {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title,
+      message,
+      buttons: [{ title: "Allow" }, { title: "Deny" }],
+      requireInteraction: true,
+      priority: 2,
+    });
+  } catch (err) {
+    throw bridgeError(
+      ErrorCodes.UNKNOWN,
+      `Failed to show consent notification: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  return new Promise<ConsentAnswer>((resolve) => {
+    consentWaiters.set(id, {
+      resolve,
+      timer: setTimeout(() => settleConsent(id, "timeout"), timeoutMs),
+    });
+  });
+}
+
+/** Label "name :port" for any bridge port (falls back to ":port"). */
+export function labelForPort(port: number): string {
+  const identity = identityFor(port);
+  return identity ? instanceLabel(identity) : `:${port}`;
+}
+
+/** Identity of a bridge port, if known. */
+export function identityOfPort(port: number): BridgeIdentity | null {
+  return identityFor(port);
+}
+
 export function initHubListeners(): void {
+  chrome.notifications.onButtonClicked.addListener((id, buttonIndex) => {
+    if (id.startsWith(CONSENT_PREFIX)) {
+      settleConsent(id, buttonIndex === 0 ? "allowed" : "denied");
+    }
+  });
+  // Clicking the notification body is not consent: only the Allow button is.
+
+  chrome.notifications.onClosed.addListener((id, byUser) => {
+    if (id.startsWith(CONSENT_PREFIX) && byUser) settleConsent(id, "denied");
+  });
   chrome.notifications.onButtonClicked.addListener((id, buttonIndex) => {
     if (id !== CONTROL_NOTIFICATION_ID) return;
     void settleGrant(buttonIndex === 0);
-  });
-  chrome.notifications.onClicked.addListener((id) => {
-    if (id !== CONTROL_NOTIFICATION_ID) return;
-    void settleGrant(true);
   });
   chrome.notifications.onClosed.addListener((id, byUser) => {
     if (id !== CONTROL_NOTIFICATION_ID) return;
@@ -121,6 +196,25 @@ export function emitEvent(event: string, payload: unknown): void {
       conn.socket.send(raw);
     }
   }
+}
+
+/** Send an event to one bridge only (tab-scoped data must not leak across sessions). */
+export function emitEventToPort(
+  port: number,
+  event: string,
+  payload: unknown,
+): void {
+  const conn = connections.get(port);
+  if (conn?.socket.readyState === WebSocket.OPEN) {
+    conn.socket.send(JSON.stringify({ type: "event", event, payload }));
+  }
+}
+
+/** Ports with an open socket right now. */
+export function connectedPorts(): number[] {
+  return [...connections.values()]
+    .filter((c) => c.socket.readyState === WebSocket.OPEN)
+    .map((c) => c.port);
 }
 
 export function respond(
@@ -304,6 +398,13 @@ async function setTokenForPort(port: number, token: string): Promise<void> {
   await chrome.storage.local.set({ [STORAGE.tokensByPort]: tokens });
 }
 
+let identitiesListener: () => void = () => {};
+
+/** Called after a discovery scan (bridge names may have become known / changed). */
+export function onIdentitiesChanged(fn: () => void): void {
+  identitiesListener = fn;
+}
+
 async function setControllerPort(port: number | null): Promise<void> {
   lastDiscovered = lastDiscovered.map((b) => ({
     ...b,
@@ -368,7 +469,15 @@ async function discoverBridges(): Promise<DiscoveredBridge[]> {
       controlling: controller != null && b.port === controller,
     }))
     .sort((a, b) => a.port - b.port);
+  const before = JSON.stringify(
+    lastDiscovered.map((b) => [b.port, b.name, b.startedAt]),
+  );
   lastDiscovered = found;
+  if (
+    before !== JSON.stringify(found.map((b) => [b.port, b.name, b.startedAt]))
+  ) {
+    queueMicrotask(() => identitiesListener());
+  }
   await chrome.storage.local.set({ [STORAGE.discovered]: found });
   return found;
 }
@@ -424,9 +533,8 @@ async function ensureConnection(
     (existing.socket.readyState === WebSocket.OPEN ||
       existing.socket.readyState === WebSocket.CONNECTING)
   ) {
-    if (bridge && existing.identity == null) {
-      existing.identity = identityFromDiscovered(bridge);
-    }
+    // Always take the freshest identity: a new process may reuse the port.
+    if (bridge) existing.identity = identityFromDiscovered(bridge);
     return;
   }
 
@@ -469,7 +577,7 @@ async function ensureConnection(
       await persistBridgeStatus();
       refreshPing();
       try {
-        await hooks?.onConnected();
+        await hooks?.onConnected(port);
       } catch {
         // state push is best-effort
       }
@@ -489,12 +597,17 @@ async function ensureConnection(
         const w = m as { token: string; port: number };
         await setTokenForPort(port, w.token);
         conn.token = w.token;
+        // Refresh identities first so onConnected sees this process's startedAt.
         try {
-          await hooks?.onConnected();
+          await refreshBridges();
+        } catch {
+          // discovery is best-effort
+        }
+        try {
+          await hooks?.onConnected(port);
         } catch {
           // ignore
         }
-        void refreshBridges();
         return;
       }
       if (m.type === "request") {
@@ -506,6 +619,7 @@ async function ensureConnection(
   ws.addEventListener("close", () => {
     if (connections.get(port)?.socket !== ws) return;
     connections.delete(port);
+    hooks?.onDisconnected?.(port);
     void persistBridgeStatus();
     void (async () => {
       const controller = await getControllerPort();
@@ -559,6 +673,8 @@ function dropConnection(port: number, fromScan: boolean): void {
     // ignore
   }
   connections.delete(port);
+  // The socket's close handler bails out once the entry is gone, so report here.
+  hooks?.onDisconnected?.(port);
 }
 
 function refreshPing(): void {

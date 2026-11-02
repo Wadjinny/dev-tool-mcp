@@ -54,9 +54,11 @@ export async function callExt(
   return getBridge().request(method, params, timeoutMs);
 }
 
+/**
+ * Idempotent on the extension side. Always ask: the cached state.changed flag
+ * can lag right after this session switches tabs.
+ */
 export async function ensureDevtoolsAttached(): Promise<void> {
-  const state = getBridge().getState();
-  if (state.debuggerAttached) return;
   await callExt("debugger.attach");
 }
 

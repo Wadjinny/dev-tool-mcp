@@ -8,6 +8,7 @@ export const ErrorCodes = {
   CDP_METHOD_DENIED: "CDP_METHOD_DENIED",
   CONTENT_SCRIPT_FAILED: "CONTENT_SCRIPT_FAILED",
   TIMEOUT: "TIMEOUT",
+  TAB_NOT_VISIBLE: "TAB_NOT_VISIBLE",
   INVALID_REF: "INVALID_REF",
   INVALID_PIN: "INVALID_PIN",
   PICK_CANCELLED: "PICK_CANCELLED",
@@ -46,6 +47,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   CDP_METHOD_DENIED: "This CDP method is not allowlisted.",
   CONTENT_SCRIPT_FAILED: "Content script injection or automation helper failed.",
   TIMEOUT: "Request timed out.",
+  TAB_NOT_VISIBLE:
+    "The Connected tab is in the background, so Chrome cannot screenshot it. Bring it to the front (or browser_open with active:true) and retry.",
   INVALID_REF: "Snapshot ref is missing or stale. Take a new browser_snapshot.",
   INVALID_PIN:
     "Pin is missing or stale. Pick the element again or use a fresh snapshot ref.",

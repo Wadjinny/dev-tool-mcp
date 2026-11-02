@@ -7,66 +7,51 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <header class="panel-header">
-      <div class="brand">dev-tool-mcp</div>
-      <div class="bridge-row">
-        <span class="label">MCP bridge</span>
+    <div id="pending" class="strip pending" hidden></div>
+
+    <div id="owner-strip" class="strip" hidden>
+      <span id="owner-dot" class="dot" aria-hidden="true"></span>
+      <span id="owner-text" class="strip-text ell"></span>
+      <button id="btn-stop" class="strip-stop" type="button">Stop</button>
+    </div>
+
+    <div class="h">
+      <b>Agents</b>
+      <span id="agent-count">Scanning…</span>
+    </div>
+    <div id="agents" class="grid"></div>
+
+    <div class="h">
+      <b id="palette-title">Commands</b>
+      <button id="palette-back" class="text-btn" type="button" hidden>Back</button>
+    </div>
+    <div id="ctx" class="ctx"></div>
+    <div id="commands" class="list" role="listbox" aria-label="Commands"></div>
+    <div class="ft">
+      <span id="ft-keys">↑↓ navigate · ↵ run</span>
+      <span class="ft-meta">
         <span id="bridge-dot" class="dot off" aria-hidden="true"></span>
-        <span id="bridge-status" class="data">…</span>
-      </div>
-    </header>
+        <span id="bridge-status">…</span>
+        <span id="ft-count"></span>
+      </span>
+    </div>
 
-    <section class="panel">
-      <h2 class="micro">This tab</h2>
-      <div id="active-title" class="title">—</div>
-      <div id="active-url" class="data url">—</div>
-      <div class="actions">
-        <button id="btn-connect" class="btn primary" type="button">Connect</button>
-        <button id="btn-disconnect" class="btn" type="button" hidden>Disconnect</button>
-        <button id="btn-pick" class="btn" type="button" hidden>Pick element</button>
-      </div>
-    </section>
+    <div id="error-panel" class="error" hidden></div>
 
-    <section class="panel">
-      <h2 class="micro">Agent target</h2>
-      <div id="target" class="data">No tab connected</div>
-      <div id="pin-count" class="data pins">Pins: 0</div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2 class="micro">Bridges</h2>
-        <button id="btn-refresh-bridges" class="btn tiny" type="button">
-          Refresh
-        </button>
-      </div>
-      <div id="bridges" class="bridges">Scanning…</div>
-      <div id="pending-control" class="pending" hidden></div>
-      <p class="hint">
-        Every local MCP server stays connected. Only one instance may mutate the
-        Connected tab; others can inspect. An agent can ask for control — you
-        Allow or Deny in a Chrome notification. Control here grants instantly.
-      </p>
-    </section>
-
-    <section class="panel" id="error-panel" hidden>
-      <h2 class="micro">Last error</h2>
-      <div id="last-error" class="error"></div>
-    </section>
-
-    <section class="panel advanced">
-      <h2 class="micro">Advanced</h2>
+    <details class="settings">
+      <summary>Settings</summary>
       <label class="port-row">
-        <span class="label">Port</span>
+        <span>Port</span>
         <input id="port" class="input" type="number" min="1" max="65535" />
-        <button id="btn-apply-port" class="btn" type="button">Apply</button>
+        <button id="btn-apply-port" class="btn dark" type="button">Apply</button>
         <button id="btn-reconnect" class="btn" type="button">Reconnect</button>
+        <button id="btn-refresh" class="btn" type="button">Refresh</button>
       </label>
       <p class="hint">
-        Access is limited to the Connected tab and a local MCP server on 127.0.0.1.
-        The debugger permission is required for DevTools-depth tools.
+        Access is limited to the Connected tab and a local MCP server on
+        127.0.0.1. The debugger permission is required for DevTools-depth tools.
       </p>
-    </section>
+    </details>
 
     <script type="module" src="popup.js"></script>
   </body>

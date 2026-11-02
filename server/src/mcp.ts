@@ -37,17 +37,62 @@ function requireRefOrPin(ref?: string, pin?: string): ToolResult | null {
   return null;
 }
 
-export function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "dev-tool-mcp",
-    version: "0.1.0",
-  });
+/** Sent to clients at initialize; agents see it when choosing tools. */
+export const SERVER_INSTRUCTIONS = `Controls the user's real Google Chrome (their profile, logins and cookies) through the dev-tool-mcp extension.
 
-  // --- Control lease ---
+Use it whenever a task needs a web browser, not only for debugging:
+- browse, search, read or summarize web pages, including pages behind the user's logins that plain web fetch cannot reach;
+- fill in forms, click through web apps, download or check things on websites;
+- test or debug a web app (DevTools: network, console, DOM, cookies, storage).
+
+Workflow: browser_open(url) -> browser_snapshot (refs like e3) -> browser_click / browser_type / browser_press_key with those refs (they wait for any navigation they trigger) -> browser_snapshot again to verify, or browser_screenshot to see the page. Use devtools_* tools for network, console and DOM details; pass recordNetwork:true to browser_open to capture the page's own load.
+
+Etiquette:
+- Each MCP session controls its own tab, marked in Chrome with a coloured tab group and border. browser_open replaces your previous tab; other sessions' tabs are not yours.
+- To work in a tab the user already has open, call browser_tabs({includeOthers:true}) then browser_connect_tab(tabId); the user must click Allow in a Chrome notification (60s).
+- Screenshots need the tab in front (open with active:true).
+- Call browser_disconnect when you are done with the browser.`;
+
+export function createMcpServer(): McpServer {
+  const server = new McpServer(
+    {
+      name: "dev-tool-mcp",
+      title: "Chrome browser (dev-tool-mcp)",
+      version: "0.1.0",
+    },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
+
+  // --- Session / tab ownership ---
+  // Each MCP session owns its own Connected tab, so sessions run in parallel.
+
+  server.tool(
+    "browser_connect_tab",
+    "Take over an existing Chrome tab (id from browser_tabs includeOthers) as this session's Connected tab. Always asks the user to Allow via a Chrome notification; replaces this session's previous Connected tab.",
+    { tabId: z.number().int().describe("Tab id from browser_tabs") },
+    async ({ tabId }) =>
+      wrap(async () =>
+        textResult(
+          await callExt(
+            "tabs.connect",
+            { tabId },
+            CONTROL_REQUEST_TIMEOUT_MS + 5_000,
+          ),
+        ),
+      ),
+  );
+
+  server.tool(
+    "browser_disconnect",
+    "Release this session's Connected tab (removes its tab group, border and badge; detaches the debugger).",
+    {},
+    async () =>
+      wrap(async () => textResult(await callExt("tabs.disconnect"))),
+  );
 
   server.tool(
     "browser_request_control",
-    "Ask to become the instance that may mutate the Connected tab. Auto-grants if nobody holds control; otherwise shows a Chrome Allow/Deny notification.",
+    "Legacy: no lease is needed any more because each session owns its own Connected tab. Returns this session's status (same as browser_control_status).",
     {},
     async () =>
       wrap(async () =>
@@ -63,7 +108,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_release_control",
-    "Yield the control lease so another instance can auto-grant without a notification.",
+    "Legacy alias of browser_disconnect: release this session's Connected tab.",
     {},
     async () =>
       wrap(async () => textResult(await callExt("control.release"))),
@@ -71,7 +116,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_control_status",
-    "Who currently holds the browser control lease (port, name, whether this instance is controlling).",
+    "This session's identity and Connected tab, plus which tabs other MCP sessions are controlling.",
     {},
     async () =>
       wrap(async () => textResult(await callExt("control.status"))),
@@ -81,7 +126,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_tabs",
-    "List the Connected tab and optionally other open tabs (read-only). Use browser_open to create and Connect a tab without the popup.",
+    "List this session's Connected tab and optionally other open tabs (read-only; others show connectedBy when another session owns them). Use browser_open to create a tab, or browser_connect_tab to take over an existing one.",
     {
       includeOthers: z.boolean().optional().describe("Include other open tabs"),
     },
@@ -96,29 +141,51 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_open",
-    "Open a URL in a new Chrome tab and Connect it for the agent. Does not require an existing Connected tab. Restricted URLs (chrome://, Web Store, …) are rejected.",
+    "Open a web page in the user's real Chrome (with their logins) to browse, read or interact with it. Creates a new tab that becomes this session's Connected tab, replacing any previous one. Start here for any task that needs a browser. Restricted URLs (chrome://, Web Store, …) are rejected.",
     {
       url: z.string().url().describe("Absolute URL to open"),
       active: z
         .boolean()
         .optional()
-        .describe("Focus the new tab (default true)"),
+        .describe("Focus the new tab (default true). Background tabs cannot be screenshotted."),
+      recordNetwork: z
+        .boolean()
+        .optional()
+        .describe(
+          "Attach the debugger before loading so devtools_network_* includes the page's own initial requests (default false; Chrome shows its 'debugging this browser' bar).",
+        ),
     },
-    async ({ url, active }) =>
+    async ({ url, active, recordNetwork }) =>
       wrap(async () =>
         textResult(
-          await callExt("tabs.open", { url, active: active ?? true }, 45_000),
+          await callExt(
+            "tabs.open",
+            { url, active: active ?? true, recordNetwork: recordNetwork ?? false },
+            45_000,
+          ),
         ),
       ),
   );
 
   server.tool(
     "browser_navigate",
-    "Navigate the Connected tab to a URL. If no tab is Connected, opens a new tab and Connects it (same as browser_open).",
-    { url: z.string().url().describe("Absolute URL to open") },
-    async ({ url }) =>
+    "Navigate this session's Connected tab to a URL. If it has none, opens a new tab and Connects it (same as browser_open).",
+    {
+      url: z.string().url().describe("Absolute URL to open"),
+      recordNetwork: z
+        .boolean()
+        .optional()
+        .describe("Attach the debugger first so the navigation's requests are captured (default false)"),
+    },
+    async ({ url, recordNetwork }) =>
       wrap(async () =>
-        textResult(await callExt("tabs.navigate", { url }, 45_000)),
+        textResult(
+          await callExt(
+            "tabs.navigate",
+            { url, recordNetwork: recordNetwork ?? false },
+            45_000,
+          ),
+        ),
       ),
   );
 
@@ -154,15 +221,25 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_press_key",
-    "Press a key on the Connected page (e.g. Enter, Escape, Tab, a).",
-    { key: z.string().describe("Key name") },
-    async ({ key }) =>
-      wrap(async () => textResult(await callExt("page.pressKey", { key }))),
+    "Press a key on the Connected page (e.g. Enter, Escape, Tab, a). If it starts a navigation, waits for it to finish and returns navigated/url.",
+    {
+      key: z.string().describe("Key name"),
+      waitForNavigation: z
+        .boolean()
+        .optional()
+        .describe("Wait for a navigation triggered by the key (default true)"),
+    },
+    async ({ key, waitForNavigation }) =>
+      wrap(async () =>
+        textResult(
+          await callExt("page.pressKey", { key, waitForNavigation }, 45_000),
+        ),
+      ),
   );
 
   server.tool(
     "browser_snapshot",
-    "Accessibility snapshot of the Connected page (main frame + iframes) with ref handles. Main-frame refs look like e3; iframe refs look like f1842.e3. May include frames[] metadata and a warning when the main frame is shell-only.",
+    "Read the current page: an accessibility snapshot of the Connected tab (main frame + iframes) listing interactive elements with their state (value, checked, …) and ref handles for browser_click / browser_type. Main-frame refs look like e3; iframe refs look like f1842.e3. May include frames[] metadata and a warning when the main frame is shell-only.",
     {
       interestingOnly: z
         .boolean()
@@ -204,7 +281,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_click",
-    "Click an element by snapshot/find ref (eN or f{frameId}.eN) or pin from browser_pick_element / browser_pins.",
+    "Click an element by snapshot/find ref (eN or f{frameId}.eN) or pin from browser_pick_element / browser_pins. If the click starts a navigation, waits for it to finish and returns navigated/url (take a fresh snapshot afterwards).",
     {
       ref: z
         .string()
@@ -213,13 +290,21 @@ export function createMcpServer(): McpServer {
       pin: z.string().optional().describe("Pin id from browser_pick_element"),
       button: z.enum(["left", "right", "middle"]).optional(),
       doubleClick: z.boolean().optional(),
+      waitForNavigation: z
+        .boolean()
+        .optional()
+        .describe("Wait for a navigation triggered by the click (default true; adds ~0.4s when none starts)"),
     },
-    async ({ ref, pin, button, doubleClick }) =>
+    async ({ ref, pin, button, doubleClick, waitForNavigation }) =>
       wrap(async () => {
         const bad = requireRefOrPin(ref, pin);
         if (bad) return bad;
         return textResult(
-          await callExt("page.click", { ref, pin, button, doubleClick }),
+          await callExt(
+            "page.click",
+            { ref, pin, button, doubleClick, waitForNavigation },
+            45_000,
+          ),
         );
       }),
   );
@@ -267,20 +352,28 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_type",
-    "Type text into an element by snapshot/find ref (eN or f{frameId}.eN) or pin.",
+    "Type text into an element by snapshot/find ref (eN or f{frameId}.eN) or pin. With submit, waits for a resulting navigation.",
     {
       ref: z.string().optional().describe("Ref eN or f{frameId}.eN"),
       pin: z.string().optional(),
       text: z.string(),
       submit: z.boolean().optional(),
       slowly: z.boolean().optional(),
+      waitForNavigation: z
+        .boolean()
+        .optional()
+        .describe("When submit is set, wait for the navigation it triggers (default true)"),
     },
-    async ({ ref, pin, text, submit, slowly }) =>
+    async ({ ref, pin, text, submit, slowly, waitForNavigation }) =>
       wrap(async () => {
         const bad = requireRefOrPin(ref, pin);
         if (bad) return bad;
         return textResult(
-          await callExt("page.type", { ref, pin, text, submit, slowly }),
+          await callExt(
+            "page.type",
+            { ref, pin, text, submit, slowly, waitForNavigation },
+            45_000,
+          ),
         );
       }),
   );
@@ -343,7 +436,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_screenshot",
-    "Capture a screenshot of the Connected tab.",
+    "Capture a screenshot of the Connected tab. The tab must be in front of its window (fails fast with TAB_NOT_VISIBLE otherwise). The agent indicator overlay is hidden during capture.",
     {
       fullPage: z
         .boolean()
@@ -425,7 +518,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "devtools_network_requests",
-    "List buffered CDP network requests (HTTP + WebSocket). Auto-attaches debugger. Buffer only fills after attach; existing related workers are attached on attach, new ones via Target.setAutoAttach.",
+    "List buffered CDP network requests (HTTP + WebSocket) for this session's tab. Auto-attaches debugger. Buffer only fills after attach (use browser_open/browser_navigate with recordNetwork:true to include the initial page load); existing related workers are attached on attach, new ones via Target.setAutoAttach.",
     {
       filter: z
         .string()
@@ -479,7 +572,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "devtools_network_summary",
-    "Compact summary of the network buffer (hosts, top paths, target types, websockets). Auto-attaches debugger. Use for discovery before fetching full request lists.",
+    "Compact summary of the network buffer (hosts, top paths with id-like segments collapsed to :id, target types, websockets). Auto-attaches debugger. Use for discovery before fetching full request lists.",
     {
       since: z
         .number()
@@ -490,13 +583,13 @@ export function createMcpServer(): McpServer {
         .int()
         .positive()
         .optional()
-        .describe("Max hosts to return (default 40)"),
+        .describe("Max hosts to return (default 15)"),
       limitPaths: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Max path aggregates to return (default 40)"),
+        .describe("Max path aggregates to return (default 15)"),
     },
     async (args) =>
       wrap(async () => {

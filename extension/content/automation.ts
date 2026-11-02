@@ -171,12 +171,53 @@ export function snapshot(interestingOnly = true): SnapshotResult {
       refs[ref] = { role, name, tag: el.tagName.toLowerCase() };
       const indent = "  ";
       const namePart = name ? ` "${name.replace(/"/g, '\\"')}"` : "";
-      lines.push(`${indent}- ${role}${namePart} [ref=${ref}]`);
+      const statePart = elementState(el);
+      lines.push(
+        `${indent}- ${role}${namePart}${statePart ? ` ${statePart}` : ""} [ref=${ref}]`,
+      );
     }
     node = walker.nextNode() as Element | null;
   }
 
   return { snapshot: lines.join("\n"), refs };
+}
+
+/** Compact live state so agents can verify their own actions from a snapshot. */
+function elementState(el: Element): string {
+  const parts: string[] = [];
+  const aria = (n: string) => el.getAttribute(n);
+  if (el instanceof HTMLInputElement) {
+    const t = el.type;
+    if (t === "checkbox" || t === "radio") {
+      if (el.checked) parts.push("[checked]");
+    } else if (t !== "password" && t !== "hidden" && el.value) {
+      parts.push(`value=${JSON.stringify(truncate(el.value))}`);
+    } else if (t === "password" && el.value) {
+      parts.push("value=<redacted>");
+    }
+  } else if (el instanceof HTMLTextAreaElement && el.value) {
+    parts.push(`value=${JSON.stringify(truncate(el.value))}`);
+  } else if (el instanceof HTMLSelectElement) {
+    const sel = el.selectedOptions[0];
+    if (sel) parts.push(`value=${JSON.stringify(truncate(sel.textContent?.trim() ?? sel.value))}`);
+  }
+  if (aria("aria-checked") === "true") parts.push("[checked]");
+  if (aria("aria-pressed") === "true") parts.push("[pressed]");
+  if (aria("aria-selected") === "true") parts.push("[selected]");
+  const expanded = aria("aria-expanded");
+  if (expanded === "true") parts.push("[expanded]");
+  else if (expanded === "false") parts.push("[collapsed]");
+  if (
+    (el as HTMLButtonElement).disabled === true ||
+    aria("aria-disabled") === "true"
+  ) {
+    parts.push("[disabled]");
+  }
+  return [...new Set(parts)].join(" ");
+}
+
+function truncate(v: string, max = 80): string {
+  return v.length > max ? `${v.slice(0, max)}…` : v;
 }
 
 export type FindMatch = {
