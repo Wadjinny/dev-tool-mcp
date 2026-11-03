@@ -4,6 +4,10 @@ Chrome Manifest V3 extension + TypeScript MCP server that lets an AI agent autom
 
 See [SPEC.md](./SPEC.md) for architecture, protocol, and tool catalog.
 
+## Download
+
+A prebuilt extension zip (`dev-tool-mcp-extension-*.zip`) is attached to each [release](https://github.com/Wadjinny/dev-tool-mcp/releases/latest). Unzip it and load the folder with **Load unpacked** in `chrome://extensions`. You still need to build and run the MCP server from source (step 1 and 2 below).
+
 ## Setup
 
 ### 1. Install and build
