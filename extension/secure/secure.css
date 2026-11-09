@@ -1,0 +1,221 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1f1f1f;
+  --muted: #5f6368;
+  --bg: #ffffff;
+  --panel: #f8f9fb;
+  --line: #e3e6ea;
+  --accent: #0e639c;
+  --accent-fg: #ffffff;
+  --danger: #b3261e;
+  --ok: #1e8e3e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8eaed;
+    --muted: #a6adb4;
+    --bg: #1f2023;
+    --panel: #26282c;
+    --line: #3a3d42;
+    --accent: #5aa9e6;
+    --accent-fg: #10222f;
+    --danger: #f28b82;
+    --ok: #81c995;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 system-ui, "Segoe UI", sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px 18px 16px;
+  background: var(--bg);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 10%);
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.lock {
+  display: inline-flex;
+  color: var(--accent);
+}
+
+h1 {
+  margin: 10px 0 2px;
+  font-size: 17px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.site,
+.target {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.site b {
+  color: var(--fg);
+}
+
+.target {
+  font-style: italic;
+}
+
+form {
+  margin-top: 12px;
+}
+
+label {
+  display: block;
+  margin-bottom: 5px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+input {
+  width: 100%;
+  font: inherit;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 10px 62px 10px 11px;
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.reveal {
+  position: absolute;
+  right: 6px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+
+.reveal:hover {
+  background: var(--line);
+  color: var(--fg);
+}
+
+.hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.status {
+  min-height: 16px;
+  margin: 8px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.status.error {
+  color: var(--danger);
+}
+
+.status.ok {
+  color: var(--ok);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.keys {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.btn {
+  font: inherit;
+  font-weight: 650;
+  border-radius: 8px;
+  padding: 8px 14px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--fg);
+}
+
+.btn.ghost:hover {
+  background: var(--panel);
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.btn.primary:hover {
+  filter: brightness(1.06);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

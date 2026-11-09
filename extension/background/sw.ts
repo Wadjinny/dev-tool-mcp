@@ -3,6 +3,7 @@ import {
   ERROR_MESSAGES,
   ErrorCodes,
   PICK_ELEMENT_TIMEOUT_MS,
+  SECURE_INPUT_TIMEOUT_MS,
   bridgeError,
   type BridgeError,
   type BridgeState,
@@ -88,6 +89,11 @@ import {
   setTabIndicator,
   withOverlayHidden,
 } from "./indicator.js";
+import {
+  cancelSecureInputForTab,
+  handleSecureInputMessage,
+  withSecureInput,
+} from "./secure-input.js";
 
 /** RPCs that don't act on the page, so they shouldn't pulse the indicator. */
 const QUIET_METHODS = new Set([
@@ -137,6 +143,7 @@ onIdentitiesChanged(() => {
 onTabOwnerChanged(async (tabId, prev, next) => {
   if (prev && !sameOwner(prev, next)) {
     // Leaving a session: drop its tab-scoped capture, pins and picker.
+    cancelSecureInputForTab(tabId, "The tab was released before the secret was submitted.");
     await clearPinsAndLocal(tabId);
     await forgetTab(tabId);
   }
@@ -153,6 +160,17 @@ setHubHooks({
     await pushStateTo(port);
   },
   onDisconnected: (port) => {
+    void (async () => {
+      // Cancel prompts for this session's tabs only, not other sessions'.
+      for (const [tabId, owner] of await listOwnedTabs()) {
+        if (owner.port === port) {
+          cancelSecureInputForTab(
+            tabId,
+            "The MCP session disconnected before the secret was submitted.",
+          );
+        }
+      }
+    })();
     if (!missingSince.has(port)) missingSince.set(port, Date.now());
     setTimeout(() => void sweepOrphanTabs(), RELEASE_GRACE_MS + 1_000);
   },
@@ -1118,6 +1136,66 @@ async function route(
       );
     }
 
+    case "page.typeSecure": {
+      const tab = await requireTabFor(me);
+      // Resolve the target before prompting: a stale ref should fail fast,
+      // not after the user has typed their secret.
+      const routed = withFrameLocalRefs(withPinTarget(tab.id!, params));
+      const submit = params.submit === true;
+      const waitForNavigation = submit && params.waitForNavigation !== false;
+      const timeoutMs =
+        typeof params.timeoutMs === "number"
+          ? Math.max(5_000, Math.min(params.timeoutMs, 300_000))
+          : SECURE_INPUT_TIMEOUT_MS;
+      let site = "";
+      try {
+        site = new URL(tab.url ?? "").host;
+      } catch {
+        // keep empty
+      }
+      const rawLabel =
+        typeof params.label === "string" ? params.label.trim() : "";
+      const label = (rawLabel || (site ? `Secure input for ${site}` : "Secure input"))
+        .slice(0, 120);
+      const kind =
+        params.kind === "text" || params.kind === "otp"
+          ? params.kind
+          : "password";
+      const targetHint =
+        typeof params.targetHint === "string"
+          ? params.targetHint.trim().slice(0, 120)
+          : "";
+
+      return withSecureInput(
+        {
+          tabId: tab.id!,
+          label,
+          site: site || "the Connected tab",
+          target: targetHint || undefined,
+          kind,
+          submit,
+          timeoutMs,
+        },
+        async (secret) => {
+          const typed = await withNavigationWait(tab.id!, waitForNavigation, () =>
+            pageAction(
+              tab.id!,
+              "typeSecret",
+              { ...routed.params, text: secret, submit },
+              routed.frameId,
+            ),
+          );
+          return {
+            ok: true,
+            filled: true,
+            chars: secret.length,
+            submitted: submit,
+            ...(typed && typeof typed === "object" ? typed : {}),
+          };
+        },
+      );
+    }
+
     case "page.pickElement": {
       const tab = await requireTabFor(me);
       const prompt =
@@ -1687,6 +1765,7 @@ chrome.debugger.onDetach.addListener((source) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelSecureInputForTab(tabId, "The tab was closed before the secret was submitted.");
   void (async () => {
     if (await getTabOwner(tabId)) await setTabOwner(tabId, null);
     await forgetTab(tabId);
@@ -1717,6 +1796,10 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   void (async () => {
     if (details.frameId !== 0) return;
     if (!(await getTabOwner(details.tabId))) return;
+    cancelSecureInputForTab(
+      details.tabId,
+      "The page navigated before the secret was submitted.",
+    );
     await clearPinsAndLocal(details.tabId);
   })();
 });
@@ -1754,6 +1837,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Messages from content scripts (picker, pin panel, overlay Stop) carry
       // their tab; popup messages act on the active tab.
       const senderTabId = sender.tab?.id;
+
+      if (msg.type === "secure.submit" || msg.type === "secure.cancel") {
+        const result = await handleSecureInputMessage(msg);
+        if (result.handled) {
+          sendResponse(
+            result.ok ? { ok: true } : { ok: false, error: result.error },
+          );
+          return;
+        }
+      }
 
       if (msg.type === "picker.picked") {
         if (senderTabId == null) throw new Error("picker message without tab");

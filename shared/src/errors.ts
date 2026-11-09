@@ -14,6 +14,10 @@ export const ErrorCodes = {
   PICK_CANCELLED: "PICK_CANCELLED",
   PICK_TIMEOUT: "PICK_TIMEOUT",
   PICK_IN_PROGRESS: "PICK_IN_PROGRESS",
+  SECURE_INPUT_CANCELLED: "SECURE_INPUT_CANCELLED",
+  SECURE_INPUT_TIMEOUT: "SECURE_INPUT_TIMEOUT",
+  SECURE_INPUT_BUSY: "SECURE_INPUT_BUSY",
+  SECURE_INPUT_FAILED: "SECURE_INPUT_FAILED",
   UNAUTHORIZED: "UNAUTHORIZED",
   PORT_NOT_AUTHORIZED: "PORT_NOT_AUTHORIZED",
   CONTROL_DENIED: "CONTROL_DENIED",
@@ -55,6 +59,14 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   PICK_CANCELLED: "Element pick was cancelled.",
   PICK_TIMEOUT: "Element pick timed out before a selection was made.",
   PICK_IN_PROGRESS: "An element pick is already in progress.",
+  SECURE_INPUT_CANCELLED:
+    "The user closed or cancelled the secure input window; nothing was typed.",
+  SECURE_INPUT_TIMEOUT:
+    "The secure input window timed out before the user submitted a value.",
+  SECURE_INPUT_BUSY:
+    "A secure input window is already open for this tab. Submit or cancel it first.",
+  SECURE_INPUT_FAILED:
+    "The secure input window could not be opened or the value could not be typed.",
   UNAUTHORIZED: "Handshake token mismatch.",
   PORT_NOT_AUTHORIZED:
     "This bridge is not currently controlling the browser. Call browser_request_control (or retry a mutating tool) and Allow the Chrome notification.",

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Secure input · dev-tool-mcp</title>
+    <link rel="stylesheet" href="secure.css" />
+  </head>
+  <body>
+    <main class="card">
+      <div class="eyebrow">
+        <span class="lock" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="10" width="16" height="10" rx="2" />
+            <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+          </svg>
+        </span>
+        <span>Secure input · dev-tool-mcp</span>
+      </div>
+
+      <h1 id="title">Secure input</h1>
+      <p class="site">Destination: <b id="site">the Connected tab</b></p>
+      <p id="target" class="target" hidden></p>
+
+      <form id="form" autocomplete="off">
+        <label id="field-label" for="secret">Secret</label>
+        <div class="field">
+          <input
+            id="secret"
+            name="secret"
+            type="password"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            aria-describedby="hint"
+          />
+          <button id="reveal" class="reveal" type="button" aria-pressed="false">
+            Show
+          </button>
+        </div>
+        <p id="hint" class="hint">
+          This value goes straight from this window into the page. The agent
+          never sees it — not in the chat, not in the tool log.
+        </p>
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <div class="actions">
+          <span class="keys" aria-hidden="true">Enter to type · Esc to cancel</span>
+          <button id="cancel" class="btn ghost" type="button">Cancel</button>
+          <button id="submit" class="btn primary" type="submit">Type it</button>
+        </div>
+      </form>
+    </main>
+    <script type="module" src="secure.js"></script>
+  </body>
+</html>

@@ -98,6 +98,8 @@ export type BridgeHealth = {
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const PICK_ELEMENT_TIMEOUT_MS = 90_000;
+/** How long a secure input window waits for the user to submit. */
+export const SECURE_INPUT_TIMEOUT_MS = 120_000;
 /** Max `waitForMs` for network.list; bridge timeout is waitForMs + slack. */
 export const MAX_NETWORK_WAIT_FOR_MS = 300_000;
 export const PROTOCOL_VERSION = 1;
@@ -252,6 +254,7 @@ export type RpcMethod =
   | "page.hover"
   | "page.drag"
   | "page.type"
+  | "page.typeSecure"
   | "page.pressKey"
   | "page.screenshot"
   | "page.evaluate"
@@ -302,6 +305,7 @@ export const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
   "page.hover",
   "page.drag",
   "page.type",
+  "page.typeSecure",
   "page.pressKey",
   "page.screenshot",
   "page.evaluate",

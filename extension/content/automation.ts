@@ -32,6 +32,47 @@ function state() {
   return window.__devToolMcp;
 }
 
+/**
+ * Fields filled through the secure-input window. Their value is redacted in
+ * snapshots for the rest of the document's life so the secret typed by the
+ * user never re-enters the agent's context.
+ */
+const secureFields = new WeakSet<Element>();
+const SECURE_ATTR = "data-dev-tool-mcp-secure";
+
+/** True for fields filled through browser_type_secure. */
+function isSecureField(el: Element): boolean {
+  return secureFields.has(el) || el.hasAttribute(SECURE_ATTR);
+}
+
+function markSecure(el: Element): void {
+  secureFields.add(el);
+  // Survives content-script re-injection (e.g. extension reload).
+  try {
+    el.setAttribute(SECURE_ATTR, "");
+  } catch {
+    // e.g. non-HTMLElement XML node
+  }
+}
+
+/** Accessible name that never falls back to a secret's text content. */
+function secureAwareName(el: Element): string {
+  if (!isSecureField(el)) return accessibleName(el);
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    return accessibleName(el);
+  }
+  const labelledBy = el.getAttribute("aria-labelledby");
+  if (labelledBy) {
+    const joined = labelledBy
+      .split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent?.trim() ?? "")
+      .filter(Boolean)
+      .join(" ");
+    if (joined) return joined;
+  }
+  return el.getAttribute("aria-label")?.trim() || "secure field";
+}
+
 function isInteresting(el: Element): boolean {
   const role = el.getAttribute("role") || implicitRole(el);
   const tag = el.tagName.toLowerCase();
@@ -165,7 +206,7 @@ export function snapshot(interestingOnly = true): SnapshotResult {
     if (visible(el) && (!interestingOnly || isInteresting(el))) {
       const role =
         el.getAttribute("role") || implicitRole(el) || el.tagName.toLowerCase();
-      const name = accessibleName(el);
+      const name = secureAwareName(el);
       const ref = `e${st.nextId++}`;
       st.refs.set(ref, el);
       refs[ref] = { role, name, tag: el.tagName.toLowerCase() };
@@ -186,7 +227,13 @@ export function snapshot(interestingOnly = true): SnapshotResult {
 function elementState(el: Element): string {
   const parts: string[] = [];
   const aria = (n: string) => el.getAttribute(n);
-  if (el instanceof HTMLInputElement) {
+  if (isSecureField(el)) {
+    const value =
+      el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
+        ? el.value
+        : (el.textContent ?? "").trim();
+    if (value) parts.push("value=<redacted>");
+  } else if (el instanceof HTMLInputElement) {
     const t = el.type;
     if (t === "checkbox" || t === "radio") {
       if (el.checked) parts.push("[checked]");
@@ -245,8 +292,10 @@ export function find(query: string, limit = 20): FindResult {
   for (const [ref, el] of st.refs) {
     const role =
       el.getAttribute("role") || implicitRole(el) || el.tagName.toLowerCase();
-    const name = accessibleName(el);
-    const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+    const name = secureAwareName(el);
+    const text = isSecureField(el)
+      ? "<redacted>"
+      : (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
     const aria = el.getAttribute("aria-label") || "";
     const title = el.getAttribute("title") || "";
     const hay = `${name} ${text} ${aria} ${title} ${role}`.toLowerCase();
@@ -415,8 +464,10 @@ export async function typeText(
   text: string,
   submit = false,
   slowly = false,
+  secure = false,
 ): Promise<{ ok: true }> {
   const el = resolveTarget(target) as HTMLElement;
+  if (secure) markSecure(el);
   el.scrollIntoView({ block: "center" });
   el.focus();
   if (
@@ -690,6 +741,15 @@ if (!window.__devToolMcpListener) {
               String(params.text),
               !!params.submit,
               !!params.slowly,
+            );
+            break;
+          case "typeSecret":
+            result = await typeText(
+              targetFromParams(params),
+              String(params.text),
+              !!params.submit,
+              false,
+              true,
             );
             break;
           case "pressKey":

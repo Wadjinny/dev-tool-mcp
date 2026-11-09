@@ -15,6 +15,7 @@ import {
   ErrorCodes,
   MAX_NETWORK_WAIT_FOR_MS,
   PICK_ELEMENT_TIMEOUT_MS,
+  SECURE_INPUT_TIMEOUT_MS,
 } from "@dev-tool-mcp/shared";
 
 async function wrap(fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -48,6 +49,8 @@ Use it whenever a task needs a web browser, not only for debugging:
 Chrome need not be open: if it is closed when a browser tool is called, the server launches it with the user's normal profile (so the installed extension and its permissions apply) and waits for the extension to connect. If the extension still does not connect, ask the user to enable dev-tool-mcp in chrome://extensions.
 
 Workflow: browser_open(url) -> browser_snapshot (refs like e3) -> browser_click / browser_type / browser_press_key with those refs (they wait for any navigation they trigger) -> browser_snapshot again to verify, or browser_screenshot to see the page. Use devtools_* tools for network, console and DOM details; pass recordNetwork:true to browser_open to capture the page's own load.
+
+Secrets: never ask the user to paste a password, OTP, API key or other secret into the chat, and never pass one as browser_type text. Call browser_type_secure on the field instead: the user types it in a secure extension window, the extension types it straight into the page, and you only receive { filled, chars, submitted }. Values entered that way are redacted from later snapshots.
 
 Etiquette:
 - Each MCP session controls its own tab, marked in Chrome with a coloured tab group and border. browser_open replaces your previous tab; other sessions' tabs are not yours.
@@ -354,7 +357,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "browser_type",
-    "Type text into an element by snapshot/find ref (eN or f{frameId}.eN) or pin. With submit, waits for a resulting navigation.",
+    "Type text into an element by snapshot/find ref (eN or f{frameId}.eN) or pin. With submit, waits for a resulting navigation. Never pass passwords, OTPs, API keys or other secrets here — use browser_type_secure.",
     {
       ref: z.string().optional().describe("Ref eN or f{frameId}.eN"),
       pin: z.string().optional(),
@@ -375,6 +378,63 @@ export function createMcpServer(): McpServer {
             "page.type",
             { ref, pin, text, submit, slowly, waitForNavigation },
             45_000,
+          ),
+        );
+      }),
+  );
+
+  server.tool(
+    "browser_type_secure",
+    "Type a secret (password, OTP, API key) into an element without the value ever entering this conversation or the tool log. Opens a secure extension window where the user types it; the extension types it straight into the page. Blocks until submit, cancel, or timeout; returns only { filled, chars, submitted } (never the value). Use this instead of asking the user for a secret in chat.",
+    {
+      ref: z.string().optional().describe("Ref eN or f{frameId}.eN"),
+      pin: z.string().optional(),
+      label: z
+        .string()
+        .optional()
+        .describe("What is being asked, e.g. 'LinkedIn password' (shown in the window)"),
+      kind: z
+        .enum(["password", "text", "otp"])
+        .optional()
+        .describe("Input style in the secure window (default password)"),
+      targetHint: z
+        .string()
+        .optional()
+        .describe("Name of the target field, e.g. 'Mot de passe'"),
+      submit: z
+        .boolean()
+        .optional()
+        .describe("Press Enter / submit the form after typing"),
+      waitForNavigation: z
+        .boolean()
+        .optional()
+        .describe("When submit is set, wait for the navigation it triggers (default true)"),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(5_000)
+        .max(300_000)
+        .optional()
+        .describe(`How long to wait for the user (default ${SECURE_INPUT_TIMEOUT_MS} ms)`),
+    },
+    async ({ ref, pin, label, kind, targetHint, submit, waitForNavigation, timeoutMs }) =>
+      wrap(async () => {
+        const bad = requireRefOrPin(ref, pin);
+        if (bad) return bad;
+        return textResult(
+          await callExt(
+            "page.typeSecure",
+            {
+              ref,
+              pin,
+              label,
+              kind,
+              targetHint,
+              submit,
+              waitForNavigation,
+              timeoutMs,
+            },
+            (timeoutMs ?? SECURE_INPUT_TIMEOUT_MS) + 15_000,
           ),
         );
       }),

@@ -75,6 +75,7 @@ async function buildOnce(): Promise<void> {
   mkdirSync(join(dist, "background"), { recursive: true });
   mkdirSync(join(dist, "content"), { recursive: true });
   mkdirSync(join(dist, "popup"), { recursive: true });
+  mkdirSync(join(dist, "secure"), { recursive: true });
   mkdirSync(join(dist, "icons"), { recursive: true });
 
   const sharedAlias = {
@@ -97,6 +98,7 @@ async function buildOnce(): Promise<void> {
     entryPoints: {
       "background/sw": join(root, "background/sw.ts"),
       "popup/popup": join(root, "popup/popup.ts"),
+      "secure/secure": join(root, "secure/secure.ts"),
     },
     outdir: dist,
     format: "esm",
@@ -114,6 +116,8 @@ async function buildOnce(): Promise<void> {
   cpSync(join(root, "manifest.json"), join(dist, "manifest.json"));
   cpSync(join(root, "popup/popup.html"), join(dist, "popup/popup.html"));
   cpSync(join(root, "popup/popup.css"), join(dist, "popup/popup.css"));
+  cpSync(join(root, "secure/secure.html"), join(dist, "secure/secure.html"));
+  cpSync(join(root, "secure/secure.css"), join(dist, "secure/secure.css"));
 
   for (const size of [16, 32, 48, 128]) {
     writePngIcon(join(dist, "icons", `icon${size}.png`), size);
@@ -134,6 +138,7 @@ if (watch) {
     entryPoints: {
       "background/sw": join(root, "background/sw.ts"),
       "popup/popup": join(root, "popup/popup.ts"),
+      "secure/secure": join(root, "secure/secure.ts"),
     },
     outdir: dist,
     bundle: true,

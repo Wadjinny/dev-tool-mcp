@@ -123,12 +123,31 @@ The overlay sits in a closed shadow root outside `<body>`, so snapshots and find
 
 ### Navigation-aware actions and network recording
 
-- `browser_click`, `browser_press_key` and `browser_type` with `submit` wait for a navigation they trigger and return `navigated`, `url` and `title`. Pass `waitForNavigation: false` to skip (no navigation costs ~0.4 s of waiting).
+- `browser_click`, `browser_press_key`, `browser_type` and `browser_type_secure` with `submit` wait for a navigation they trigger and return `navigated`, `url` and `title`. Pass `waitForNavigation: false` to skip (no navigation costs ~0.4 s of waiting).
 - `browser_open` / `browser_navigate` with `recordNetwork: true` attach the debugger **before** loading, so `devtools_network_*` includes the page's own initial requests. Off by default because Chrome then shows its "started debugging this browser" bar.
 - `devtools_network_summary` collapses id-like path segments (numbers, UUIDs, long tokens) to `:id`, and returns 15 hosts / 15 paths by default.
 - `browser_screenshot` fails immediately with `TAB_NOT_VISIBLE` when the tab is in the background (Chrome can only capture the front tab).
 
-### 5. Pin elements (optional)
+### 5. Secure input (passwords, OTPs, API keys)
+
+Never paste a secret into chat or pass it as `browser_type.text`. Call `browser_type_secure` on the field instead:
+
+```jsonc
+{ "ref": "e12", "label": "LinkedIn password", "kind": "password", "submit": true }
+```
+
+A small extension window opens **outside the page**, so the page's own scripts cannot read what you type. The value goes from that window through the extension into the Connected tab, then the window closes. The tool returns only `{ filled, chars, submitted }` (+ `navigated`/`url`/`title` when `submit` navigates); the secret is never a tool argument, a tool result, or part of the conversation.
+
+- `kind`: `password` (default), `text`, or `otp`.
+- `label`, `targetHint`: shown in the window so you can check what is being asked and where it goes.
+- `timeoutMs`: how long to wait for you (default `120000`, max `300000`).
+- Cancel, Esc or closing the window returns `SECURE_INPUT_CANCELLED`; a timeout returns `SECURE_INPUT_TIMEOUT`. No value is typed in either case. One secure window per tab at a time (`SECURE_INPUT_BUSY`).
+
+Fields filled this way are marked and redacted (`value=<redacted>`) in later snapshots and find results.
+
+**Caveat:** this keeps the value out of the agent's context, not away from the page. The destination site receives it normally, and its scripts can mirror it into other fields. Check the destination host shown in the window before typing.
+
+### 6. Pin elements (optional)
 
 After Connect, use **Pick element** in the popup (or have the agent call `browser_pick_element`) to enter in-page pick mode. Hover highlights a target; click pins it as `pin_N`. Esc cancels. Pins accumulate until clear, navigation, or Disconnect. Interaction tools accept `pin` instead of a snapshot `ref`. The in-page pin panel has a copy button for `dev-tool-mcp://tab/{tabId}/pin/{id}`.
 
@@ -136,7 +155,7 @@ After Connect, use **Pick element** in the popup (or have the agent call `browse
 
 **Session**: `browser_connect_tab`, `browser_disconnect`, `browser_control_status` (legacy: `browser_request_control`, `browser_release_control`)
 
-**Automation** (no debugger required): `browser_tabs`, `browser_open`, `browser_navigate`, `browser_go_back` / `browser_go_forward`, `browser_wait`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_drag`, `browser_type`, `browser_press_key`, `browser_screenshot`, `browser_console_messages`, `browser_pick_element`, `browser_pick_cancel`, `browser_pins`, `browser_pin_inspect`, `browser_pin_clear`
+**Automation** (no debugger required): `browser_tabs`, `browser_open`, `browser_navigate`, `browser_go_back` / `browser_go_forward`, `browser_wait`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_drag`, `browser_type`, `browser_type_secure`, `browser_press_key`, `browser_screenshot`, `browser_console_messages`, `browser_pick_element`, `browser_pick_cancel`, `browser_pins`, `browser_pin_inspect`, `browser_pin_clear`
 
 **DevTools** (auto-attaches CDP on first use): `devtools_attach` / `devtools_detach`, `devtools_targets`, `devtools_network_requests` (rich filters, WebSocket, `waitForMs` up to 300s), `devtools_network_summary`, `devtools_network_request`, `devtools_network_body`, `devtools_network_for_pin`, `devtools_console_messages`, `devtools_evaluate` (pin-bound `el`, CSP fallback to main/CDP), `devtools_get_box_model`, `devtools_get_computed_style`, `devtools_cookies`, `devtools_storage`, `devtools_cdp` (allowlisted domains including read-mostly `Target.*`)
 
@@ -156,6 +175,7 @@ Reload the unpacked extension in Chrome after rebuilds.
 - Localhost WebSocket + HTTP handshake only (token fetched **per port**)
 - Page-affecting commands rejected until you Connect a tab in the popup
 - Each session acts only on its own Connected tab; taking over a tab another session owns asks you to Allow
+- Secrets typed through `browser_type_secure` stay in the extension window and the page; they never enter the agent's context
 - No cloud relay of browser traffic
 
 ## Manual test checklist
@@ -169,6 +189,9 @@ Reload the unpacked extension in Chrome after rebuilds.
 - [ ] `browser_open` / `browser_navigate` to `chrome://` fails with RESTRICTED_URL
 - [ ] Connect fails on `chrome://` with a clear error
 - [ ] `browser_snapshot` then `browser_click` / `browser_type` work
+- [ ] `browser_type_secure` opens a separate extension window, types the value, and returns only `{ filled, chars, submitted }`
+- [ ] Cancel / Esc / closing the secure window returns `SECURE_INPUT_CANCELLED` and types nothing; timeout returns `SECURE_INPUT_TIMEOUT`; a second prompt on the same tab returns `SECURE_INPUT_BUSY`
+- [ ] A text field filled through `browser_type_secure` shows `value=<redacted>` in later snapshots and find results
 - [ ] Popup **Pick element** or `browser_pick_element` pins a node; `browser_pins` lists it; `browser_pin_inspect` returns attrs/relatedUrls
 - [ ] Esc during pick returns `PICK_CANCELLED`; idle pick times out (~90s)
 - [ ] `browser_click({ pin })` works without a fresh snapshot

@@ -87,6 +87,7 @@ sequenceDiagram
 3. **Per-port handshake token**: Each MCP instance has its own token (file, env, or generated). The extension fetches `GET /handshake` **per port** and stores `tokensByPort`. A mismatch closes only that socket.
 4. **Per-session tabs**: The extension keeps a WebSocket to every discovered instance (ports 17373–17392, max 20). Each session owns at most one Connected tab and all tab-scoped RPCs act only on it. `browser_connect_tab` on a tab owned by another session asks the user to Allow/Deny. Optional display name via `DEV_TOOL_MCP_NAME`.
 5. **No cloud**: Browser content stays on the machine; MCP host (Cursor) still receives tool results in its context by design of MCP.
+6. **Secure input**: `browser_type_secure` opens a dedicated extension window (`chrome-extension://…/secure/secure.html`) — not an in-page overlay, so the page's scripts cannot read what is being typed. The value goes from that window straight to the service worker and content script, which type it into the Connected tab. It is never a tool argument, tool result, log line, or snapshot value. The tool returns only `{ filled, chars, submitted }`, and fields filled this way are redacted in later snapshots/find results. This protects the secret from the agent, not from the destination page, which receives it normally.
 
 ### Connection state (server)
 
@@ -117,9 +118,14 @@ extension/
     debugger.ts        # attach/detach, CDP send, event buffers
     tabs.ts            # Connect state, restricted-URL checks
     pins.ts            # pin store + blocking pick waiter
+    secure-input.ts    # extension-window secret prompt + delivery
   content/
     automation.ts      # snapshot, click, type, hover, drag (isolated world)
     picker.ts          # in-page pick overlay + selector helper
+  secure/
+    secure.html        # secure input window (own document, no page script access)
+    secure.css
+    secure.ts
   popup/
     popup.html
     popup.css
@@ -420,6 +426,18 @@ Each endpoint requires exactly one of ref or pin.
 
 **Params**: `{ ref?: string, pin?: string, text: string, submit?: boolean, slowly?: boolean }` (exactly one of ref/pin)  
 **Returns**: `{ ok: true }`
+
+Never pass a secret as `text`; use `browser_type_secure`.
+
+#### `browser_type_secure`
+
+Ask the user to type a secret (password, OTP, API key) into a dedicated extension window, then type it into the target. Blocks until submit, cancel, or timeout (default 120s, max 300s).
+
+**Params**: `{ ref?: string, pin?: string, label?: string, kind?: "password" | "text" | "otp", targetHint?: string, submit?: boolean, waitForNavigation?: boolean, timeoutMs?: number }` (exactly one of ref/pin)  
+**Returns**: `{ filled: true, chars: number, submitted: boolean, navigated?, url?, title? }` — never the value.  
+Errors: `SECURE_INPUT_CANCELLED`, `SECURE_INPUT_TIMEOUT`, `SECURE_INPUT_BUSY`, `SECURE_INPUT_FAILED`.
+
+RPC: `page.typeSecure`. The window is an extension page (not an in-page overlay); the value flows window → service worker → content script `typeSecret` action → element, and the element is marked so snapshots/find show `value=<redacted>`. A main-frame navigation, tab close, Disconnect, or session disconnect cancels a pending prompt.
 
 #### `browser_pick_element`
 
