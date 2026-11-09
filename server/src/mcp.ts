@@ -45,6 +45,8 @@ Use it whenever a task needs a web browser, not only for debugging:
 - fill in forms, click through web apps, download or check things on websites;
 - test or debug a web app (DevTools: network, console, DOM, cookies, storage).
 
+Chrome need not be open: if it is closed when a browser tool is called, the server launches it with the user's normal profile (so the installed extension and its permissions apply) and waits for the extension to connect. If the extension still does not connect, ask the user to enable dev-tool-mcp in chrome://extensions.
+
 Workflow: browser_open(url) -> browser_snapshot (refs like e3) -> browser_click / browser_type / browser_press_key with those refs (they wait for any navigation they trigger) -> browser_snapshot again to verify, or browser_screenshot to see the page. Use devtools_* tools for network, console and DOM details; pass recordNetwork:true to browser_open to capture the page's own load.
 
 Etiquette:

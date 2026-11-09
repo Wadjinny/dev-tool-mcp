@@ -26,12 +26,65 @@ import {
   getBridgeState,
   markExtensionConnected,
 } from "./state.js";
+import {
+  chromeLaunchDisabled,
+  configuredBrowserBin,
+  isBrowserRunning,
+  launchBrowser,
+} from "./chrome.js";
 
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: Error & { code?: string }) => void;
   timer: NodeJS.Timeout;
 };
+
+/** How long to wait for a server `close()` callback before giving up on it. */
+const CLOSE_TIMEOUT_MS = 1_000;
+
+/** Read a millisecond timeout from the environment, with a sane default. */
+function envTimeout(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+/** A just-woken extension service worker gets this long to dial us. */
+const EXTENSION_WAIT_MS = 5_000;
+/** Chrome startup + extension boot can take a little while on a cold machine. */
+const CHROME_START_WAIT_MS = envTimeout(
+  "DEV_TOOL_MCP_CHROME_CONNECT_TIMEOUT_MS",
+  25_000,
+);
+/** Do not block every tool call while Chrome is closed or the extension is off. */
+const CONNECT_ATTEMPT_COOLDOWN_MS = 10_000;
+
+/**
+ * Run a `close()` that may legitimately never invoke its callback (a server
+ * that was never listening, or one whose peers do not disconnect). Resolving
+ * anyway is what keeps shutdown from hanging forever.
+ */
+function closeWithDeadline(
+  start: (done: () => void) => void,
+  ms = CLOSE_TIMEOUT_MS,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    timer.unref?.();
+    try {
+      start(finish);
+    } catch {
+      // Nothing to close, or already closed.
+      finish();
+    }
+  });
+}
 
 /**
  * Probe an in-use port to see whether the listener is another dev-tool-mcp
@@ -67,6 +120,11 @@ export class WsBridge {
   /** Port the extension says it controls; null until it announces a choice. */
   private activePort: number | null = null;
   private readonly startedAt = Date.now();
+  /** Throttles the launch/wait logic so failures do not stall every call. */
+  private lastConnectAttempt = 0;
+  private connectAttempt: Promise<void> | null = null;
+  /** Set by stop() so an in-flight launch cannot open Chrome during shutdown. */
+  private stopped = false;
   /** Port we were asked to use; the bound port may differ after fallback. */
   readonly preferredPort: number;
   readonly token: string;
@@ -115,6 +173,7 @@ export class WsBridge {
    * finds instances by scanning it, and a random high port is invisible there.
    */
   async start(): Promise<void> {
+    this.stopped = false;
     let lastErr: unknown = null;
 
     for (const candidate of discoveryPorts(this.preferredPort)) {
@@ -197,24 +256,122 @@ export class WsBridge {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(Object.assign(new Error("Bridge shutting down"), { code: ErrorCodes.EXTENSION_DISCONNECTED }));
       this.pending.delete(id);
     }
-    this.socket?.close();
+
+    const socket = this.socket;
+    const wss = this.wss;
+    const httpServer = this.httpServer;
     this.socket = null;
-    await new Promise<void>((resolve) => {
-      this.wss?.close(() => resolve());
-    });
-    await new Promise<void>((resolve) => {
-      this.httpServer?.close(() => resolve());
-    });
+    this.wss = null;
+    this.httpServer = null;
     this.boundPort = null;
+
+    try {
+      socket?.close();
+    } catch {
+      // already closing
+    }
+
+    // Both closes are best-effort: if either never calls back we still resolve,
+    // so SIGTERM/SIGINT cannot leave an orphaned process holding a port.
+    const closes: Array<Promise<void>> = [];
+    if (wss) closes.push(closeWithDeadline((done) => wss.close(() => done())));
+    if (httpServer) {
+      closes.push(closeWithDeadline((done) => httpServer.close(() => done())));
+    }
+    await Promise.all(closes);
   }
 
   isExtensionConnected(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  /** Poll until the extension attaches, `ms` elapses, or the bridge stops. */
+  private async waitForExtension(ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (!this.stopped && Date.now() < deadline) {
+      if (this.isExtensionConnected()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return !this.stopped && this.isExtensionConnected();
+  }
+
+  /**
+   * Make a best effort to get the extension connected before failing a tool
+   * call: wait for a reconnecting service worker, and if no Chrome process is
+   * running, launch Chrome (normal profile, so the installed extension keeps
+   * its permissions) and wait for it to dial in.
+   */
+  private ensureExtensionConnection(): Promise<void> {
+    if (this.isExtensionConnected() || this.stopped) {
+      return Promise.resolve();
+    }
+    if (this.connectAttempt) return this.connectAttempt;
+    // Throttle: a closed Chrome (or a disabled extension) should not make every
+    // subsequent tool call wait again. Stamp when an attempt *finishes*, since
+    // a cold launch can easily exceed the cooldown on its own.
+    if (Date.now() - this.lastConnectAttempt < CONNECT_ATTEMPT_COOLDOWN_MS) {
+      return Promise.resolve();
+    }
+    this.connectAttempt = this.tryEnsureExtensionConnection().finally(() => {
+      this.lastConnectAttempt = Date.now();
+      this.connectAttempt = null;
+    });
+    return this.connectAttempt;
+  }
+
+  private async tryEnsureExtensionConnection(): Promise<void> {
+    if (this.isExtensionConnected() || this.stopped) return;
+
+    // A sleeping MV3 service worker may already be on its way back.
+    if (await this.waitForExtension(1_500)) return;
+    if (this.stopped || !this.isListening()) return;
+
+    if (chromeLaunchDisabled()) {
+      await this.waitForExtension(EXTENSION_WAIT_MS);
+      return;
+    }
+
+    // Check only the browser we would launch: a running Edge/Brave must not
+    // stop us opening the Chrome that actually holds the extension.
+    const bin = configuredBrowserBin();
+    const running = await isBrowserRunning(bin);
+    if (running) {
+      // Chrome is up; give the extension a chance to wake/reconnect.
+      await this.waitForExtension(EXTENSION_WAIT_MS);
+      return;
+    }
+
+    // The client may have gone away while we were probing processes.
+    if (this.stopped || !this.isListening()) return;
+
+    console.error(
+      "[dev-tool-mcp] Chrome is not running; launching it so the extension can connect…",
+    );
+    const result = await launchBrowser();
+    if (!result.launched) {
+      console.error(
+        `[dev-tool-mcp] Could not launch Chrome: ${result.error ?? "unknown error"}. ` +
+          "Set DEV_TOOL_MCP_CHROME_BIN to the browser executable, or start Chrome manually.",
+      );
+      return;
+    }
+    console.error(
+      `[dev-tool-mcp] Launched Chrome (${result.command}); waiting for the extension…`,
+    );
+    if (await this.waitForExtension(CHROME_START_WAIT_MS)) {
+      console.error("[dev-tool-mcp] Chrome extension connected.");
+    } else if (!this.stopped) {
+      console.error(
+        "[dev-tool-mcp] Chrome started but the extension did not connect. " +
+          "Make sure dev-tool-mcp is loaded in that profile (chrome://extensions).",
+      );
+    }
   }
 
   getState(): BridgeState {
@@ -248,9 +405,15 @@ export class WsBridge {
     }
 
     if (!this.isExtensionConnected() || !this.socket) {
+      // Chrome may simply not be open yet. Launch it (once, throttled) and
+      // give the extension time to connect before failing the tool call.
+      await this.ensureExtensionConnection();
+    }
+
+    if (!this.isExtensionConnected() || !this.socket) {
       const detail =
         this.port === this.preferredPort
-          ? "Extension is not connected."
+          ? "Extension is not connected. Chrome was either not running (and could not be launched) or dev-tool-mcp is not loaded/enabled in Chrome."
           : `Extension is not connected. This instance listens on ${this.port}, not the default ${this.preferredPort}. Reload the extension or wait for discovery to attach this port.`;
       const err = Object.assign(
         new Error(bridgeError(ErrorCodes.EXTENSION_DISCONNECTED, detail).message),
@@ -285,7 +448,28 @@ export class WsBridge {
       }, effectiveTimeout);
 
       this.pending.set(id, { resolve, reject, timer });
-      this.socket!.send(JSON.stringify(msg));
+      const fail = (message: string): void => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(
+          Object.assign(new Error(message), {
+            code: ErrorCodes.EXTENSION_DISCONNECTED,
+          }),
+        );
+      };
+      try {
+        this.socket!.send(JSON.stringify(msg), (err) => {
+          if (err) fail(`Failed to send request: ${err.message}`);
+        });
+      } catch (err) {
+        fail(
+          `Failed to send request: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     });
   }
 

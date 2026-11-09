@@ -85,7 +85,7 @@ sequenceDiagram
 1. **Localhost only**: WebSocket listens on `127.0.0.1` (never `0.0.0.0`).
 2. **Connect gate**: Page-affecting commands require a Connected tab. The user can Connect from the popup, or the agent can `browser_open` / `browser_navigate` a non-restricted URL (creates a tab and Connects it). Restricted URLs (`chrome://`, Web Store, …) are always rejected.
 3. **Per-port handshake token**: Each MCP instance has its own token (file, env, or generated). The extension fetches `GET /handshake` **per port** and stores `tokensByPort`. A mismatch closes only that socket.
-4. **Control lease**: The extension keeps a WebSocket to every discovered instance (ports 17373–17392, max 20). Read-only RPCs work from all. Mutating RPCs require the lease: auto-grant if free, otherwise a Chrome Allow/Deny notification. Popup **Control** grants instantly. Optional display name via `DEV_TOOL_MCP_NAME`.
+4. **Per-session tabs**: The extension keeps a WebSocket to every discovered instance (ports 17373–17392, max 20). Each session owns at most one Connected tab and all tab-scoped RPCs act only on it. `browser_connect_tab` on a tab owned by another session asks the user to Allow/Deny. Optional display name via `DEV_TOOL_MCP_NAME`.
 5. **No cloud**: Browser content stays on the machine; MCP host (Cursor) still receives tool results in its context by design of MCP.
 
 ### Connection state (server)
@@ -153,6 +153,7 @@ server/
 ### WebSocket protocol
 
 - **Transport**: `ws://127.0.0.1:<port>` (default port **17373**, overridable via env `DEV_TOOL_MCP_WS_PORT`). The extension connects to **every** instance in the discovery band (17373–17392).
+- **Browser startup**: when a tool needs the extension and none is connected, the server waits briefly for a reconnect. If no Chrome process is running it launches Chrome with the user's normal profile (so the installed extension keeps its permissions), then waits up to `DEV_TOOL_MCP_CHROME_CONNECT_TIMEOUT_MS` (default 25 s). Disable with `DEV_TOOL_MCP_LAUNCH_CHROME=0`; configure with `DEV_TOOL_MCP_CHROME_BIN`, `DEV_TOOL_MCP_CHROME_PROFILE`, `DEV_TOOL_MCP_CHROME_USER_DATA_DIR`, `DEV_TOOL_MCP_CHROME_ARGS`, and `DEV_TOOL_MCP_CHROME_EXTENSION`.
 - **Framing**: one JSON object per WebSocket message (text frames).
 - **Direction**:
   - Server → extension: `request`

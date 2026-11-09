@@ -65,6 +65,22 @@ Optional `DEV_TOOL_MCP_NAME` is the label shown in the popup and in control-requ
 
 Up to **20** instances can bind in the discovery band `17373–17392`. The extension opens a WebSocket to each and keeps them all connected.
 
+### Chrome does not need to be running
+
+If Chrome is closed when a browser tool is called, the server launches it with your normal profile — so the installed extension keeps its granted permissions — waits for the extension to connect (up to ~25 s), then runs the tool. If Chrome is already running but the extension has not connected yet, it waits for the extension to reconnect instead of opening another window.
+
+All of this is optional to configure:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEV_TOOL_MCP_LAUNCH_CHROME` | on | Set to `0`/`false`/`off` to never launch Chrome automatically. |
+| `DEV_TOOL_MCP_CHROME_BIN` | auto-detected | Browser executable, e.g. `/usr/bin/google-chrome`. |
+| `DEV_TOOL_MCP_CHROME_PROFILE` | Chrome's default | `--profile-directory` value, e.g. `Default` or `Profile 1`. |
+| `DEV_TOOL_MCP_CHROME_USER_DATA_DIR` | Chrome's default | `--user-data-dir`, for a separate profile. |
+| `DEV_TOOL_MCP_CHROME_ARGS` | none | Extra flags, e.g. `--start-maximized`. |
+| `DEV_TOOL_MCP_CHROME_EXTENSION` | none | Unpacked extension folder to force-load with `--load-extension` (Chromium / Chrome for Testing). |
+| `DEV_TOOL_MCP_CHROME_CONNECT_TIMEOUT_MS` | `25000` | How long to wait for the extension after launching. |
+
 ### 3. Load the extension
 
 1. Open `chrome://extensions`
@@ -139,12 +155,13 @@ Reload the unpacked extension in Chrome after rebuilds.
 
 - Localhost WebSocket + HTTP handshake only (token fetched **per port**)
 - Page-affecting commands rejected until you Connect a tab in the popup
-- Mutating commands also require the control lease (notification or popup Control)
+- Each session acts only on its own Connected tab; taking over a tab another session owns asks you to Allow
 - No cloud relay of browser traffic
 
 ## Manual test checklist
 
 - [ ] MCP server starts; `/health` and `/handshake` respond on 127.0.0.1
+- [ ] With Chrome closed, `browser_open` launches Chrome, the extension connects, and the page opens
 - [ ] Extension popup shows bridge Connected
 - [ ] Connect on a normal https tab; badge shows ON
 - [ ] `browser_open` with an https URL creates a tab, Connects it, and badge shows ON (no popup Connect needed)

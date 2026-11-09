@@ -347,8 +347,14 @@ export async function waitForLoad(
 ): Promise<void> {
   const tab = await getTab(tabId);
   if (!tab) throw bridgeError(ErrorCodes.TAB_GONE, "Tab gone.");
-  if (load === "complete" && tab.status === "complete") return;
-  if (load === "domcontentloaded" && tab.status !== "loading") return;
+  // `status` still describes the *old* document right after chrome.tabs.update;
+  // the requested navigation only shows up in `pendingUrl`. Returning on
+  // status alone would report the previous page as loaded.
+  const navigating = typeof tab.pendingUrl === "string" && tab.pendingUrl !== "";
+  if (load === "complete" && tab.status === "complete" && !navigating) return;
+  if (load === "domcontentloaded" && tab.status !== "loading" && !navigating) {
+    return;
+  }
 
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -356,25 +362,26 @@ export async function waitForLoad(
       reject(bridgeError(ErrorCodes.TIMEOUT, "Load wait timed out."));
     }, timeoutMs);
 
+    const isLoaded = (current: chrome.tabs.Tab | null): boolean => {
+      if (!current) return false;
+      const pending =
+        typeof current.pendingUrl === "string" && current.pendingUrl !== "";
+      return current.status === "complete" && !pending;
+    };
+
     const onUpdated = (
       updatedId: number,
       info: { status?: string },
     ) => {
       if (updatedId !== tabId) return;
-      if (load === "complete" && info.status === "complete") {
+      if (info.status !== "complete") return;
+      // Re-read the tab: "complete" can describe the outgoing document while
+      // the requested navigation is still pending.
+      void getTab(tabId).then((current) => {
+        if (!isLoaded(current)) return;
         cleanup();
         resolve();
-      }
-      if (
-        load === "domcontentloaded" &&
-        (info.status === "complete" || info.status === "loading")
-      ) {
-        // status "loading" means navigation started; wait for complete for safety
-        if (info.status === "complete") {
-          cleanup();
-          resolve();
-        }
-      }
+      });
     };
 
     const cleanup = () => {
@@ -383,5 +390,11 @@ export async function waitForLoad(
     };
 
     chrome.tabs.onUpdated.addListener(onUpdated);
+    // Close the gap between the status check above and adding the listener.
+    void getTab(tabId).then((current) => {
+      if (!isLoaded(current)) return;
+      cleanup();
+      resolve();
+    });
   });
 }

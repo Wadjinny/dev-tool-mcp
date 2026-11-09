@@ -35,7 +35,7 @@ export function bridgeError(code: ErrorCode, message: string): BridgeError {
 
 export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   EXTENSION_DISCONNECTED:
-    "Extension is not connected. Load the unpacked extension and ensure the MCP server is running.",
+    "Extension is not connected. The server launches Chrome automatically when it is closed; if Chrome is already open, make sure dev-tool-mcp is loaded and enabled.",
   NO_CONNECTED_TAB:
     "No tab Connected. Call browser_open with a URL, or click Connect in the extension popup.",
   TAB_GONE: "The Connected tab was closed.",
