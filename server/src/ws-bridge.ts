@@ -11,6 +11,7 @@ import {
   discoveryPorts,
   isMutatingRpc,
   parseInstanceName,
+  parseAutoAllow,
   type BridgeHealth,
   type BridgeIdentity,
   type BridgeMessage,
@@ -152,6 +153,7 @@ export class WsBridge {
       port: this.port,
       preferredPort: this.preferredPort,
       name: parseInstanceName(process.env.DEV_TOOL_MCP_NAME),
+      autoAllow: parseAutoAllow(process.env.DEV_TOOL_MCP_AUTO_ALLOW),
     };
   }
 

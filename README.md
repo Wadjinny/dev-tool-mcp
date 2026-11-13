@@ -80,6 +80,15 @@ All of this is optional to configure:
 | `DEV_TOOL_MCP_CHROME_ARGS` | none | Extra flags, e.g. `--start-maximized`. |
 | `DEV_TOOL_MCP_CHROME_EXTENSION` | none | Unpacked extension folder to force-load with `--load-extension` (Chromium / Chrome for Testing). |
 | `DEV_TOOL_MCP_CHROME_CONNECT_TIMEOUT_MS` | `25000` | How long to wait for the extension after launching. |
+| `DEV_TOOL_MCP_AUTO_ALLOW` | off | Set to `1`/`true`/`yes`/`on` so the extension auto-grants **this** instance's control-lease and `browser_connect_tab` requests instead of showing an Allow/Deny notification. For headless / unattended agent sessions where nobody can click the prompt. See the security note below. |
+
+### Auto-allow (unattended sessions)
+
+The Connect gate normally asks you to Allow/Deny when an instance tries to take control of the browser or steal a tab from another session. In a headless session (no display, or you're driving Claude remotely) there is nobody to click that prompt, so the request times out.
+
+Set `DEV_TOOL_MCP_AUTO_ALLOW=1` on an instance you trust to drive the browser unattended. That instance advertises an `autoAllow` flag over its local `/health`, and the extension grants its control-lease and connect-tab requests **without** a prompt. It is **opt-in and per-instance** (default off): every other instance still shows the Allow/Deny notification, so you are only waiving the prompt for the specific sessions you launch with this flag.
+
+> Security: the flag is self-declared by the instance, so it is a convenience for *your own* trusted sessions on localhost — not a trust boundary against hostile local processes (which could already set it themselves). The real boundaries remain unchanged: the server binds `127.0.0.1` only, and every bridge still requires its per-port handshake token. Leave it off unless a human genuinely can't answer the prompt.
 
 ### 3. Load the extension
 

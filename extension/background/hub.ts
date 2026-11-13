@@ -37,6 +37,7 @@ export type DiscoveredBridge = {
   startedAt: number;
   preferredPort: number;
   name: string | null;
+  autoAllow: boolean;
   extensionConnected: boolean;
   controlling: boolean;
 };
@@ -448,6 +449,7 @@ async function probeBridgePort(port: number): Promise<DiscoveredBridge | null> {
       startedAt: health.identity.startedAt,
       preferredPort: health.identity.preferredPort,
       name: health.identity.name ?? null,
+      autoAllow: health.identity.autoAllow === true,
       extensionConnected: false,
       controlling: false,
     };
@@ -708,7 +710,17 @@ function identityFromDiscovered(bridge: DiscoveredBridge): BridgeIdentity {
     port: bridge.port,
     preferredPort: bridge.preferredPort,
     name: bridge.name,
+    autoAllow: bridge.autoAllow,
   };
+}
+
+/**
+ * Whether the bridge on `port` self-declared `DEV_TOOL_MCP_AUTO_ALLOW`. Such
+ * instances skip the Allow/Deny prompt for control-lease and connect-tab
+ * requests (set only on instances trusted to drive the browser unattended).
+ */
+export function isPortAutoAllowed(port: number | null): boolean {
+  return identityFor(port)?.autoAllow === true;
 }
 
 function identityFor(port: number | null): BridgeIdentity | null {
@@ -754,6 +766,17 @@ function resolvePending(): void {
 }
 
 async function waitForUserGrant(port: number): Promise<void> {
+  // Auto-allow instances (DEV_TOOL_MCP_AUTO_ALLOW) take control without a prompt
+  // — there may be no human present to answer the notification.
+  if (isPortAutoAllowed(port)) {
+    const previous = await getControllerPort();
+    await grantControl(
+      port,
+      previous != null && previous !== port ? "stolen" : "granted",
+    );
+    return;
+  }
+
   if (pendingGrant) {
     if (pendingGrant.port !== port) {
       throw bridgeError(

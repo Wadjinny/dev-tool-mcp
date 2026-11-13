@@ -1,7 +1,7 @@
 {
   "name": "dev-tool-mcp",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chrome MV3 extension + MCP server for agent automation of a Connected tab",
   "scripts": {
     "build": "pnpm -r run build",

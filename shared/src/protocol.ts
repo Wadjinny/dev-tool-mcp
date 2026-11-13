@@ -61,7 +61,22 @@ export type BridgeIdentity = {
   preferredPort: number;
   /** From `DEV_TOOL_MCP_NAME`; display-only, not a unique key. */
   name: string | null;
+  /**
+   * From `DEV_TOOL_MCP_AUTO_ALLOW`. When true, the extension auto-grants this
+   * instance's control-lease and connect-tab requests instead of prompting the
+   * user with an Allow/Deny notification. Opt-in, per-instance, default false:
+   * only set it on instances you trust to drive the browser unattended (e.g. a
+   * headless agent session where nobody can click the prompt). Older bridges
+   * omit the field, so treat `undefined` as false.
+   */
+  autoAllow?: boolean;
 };
+
+/** Parse a boolean-ish env value (`1/true/yes/on`). Default false. */
+export function parseAutoAllow(raw?: string | null): boolean {
+  if (raw == null) return false;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
+}
 
 export function parseInstanceName(raw?: string | null): string | null {
   const trimmed = raw?.trim() ?? "";

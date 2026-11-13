@@ -36,6 +36,7 @@ import {
   getControllerPort,
   getTokenForPort,
   identityOfPort,
+  isPortAutoAllowed,
   initHubListeners,
   labelForPort,
   onIdentitiesChanged,
@@ -880,7 +881,10 @@ async function connectExistingTab(
   const tab = await assertConnectable(tabId);
   const me = ownerOf(port);
   const current = await getTabOwner(tabId);
-  if (!sameOwner(current, me)) {
+  if (!sameOwner(current, me) && isPortAutoAllowed(port)) {
+    // Trusted auto-allow instance: take the tab over without prompting.
+    await assignTab(port, tabId);
+  } else if (!sameOwner(current, me)) {
     let origin = tab.url ?? "";
     try {
       origin = new URL(tab.url ?? "").host;
